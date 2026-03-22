@@ -1,4 +1,4 @@
-use crate::card::{BonusIcon, CardDef, CardType, House, Keyword, Rarity};
+use crate::card::{BonusIcon, CardDef, CardType, Effect, House, Keyword, Rarity};
 
 // --- Brobnar ---
 
@@ -12,6 +12,10 @@ pub static TROLL: CardDef = CardDef {
     bonus_icons: &[BonusIcon::Aember],
     traits: &["Giant"],
     rarity: Rarity::Common,
+    on_reap: &[],
+    on_fight: &[],
+    on_play: &[],
+    on_destroyed: &[],
 };
 
 pub static BANNER_OF_BATTLE: CardDef = CardDef {
@@ -24,6 +28,10 @@ pub static BANNER_OF_BATTLE: CardDef = CardDef {
     bonus_icons: &[],
     traits: &["Item"],
     rarity: Rarity::Uncommon,
+    on_reap: &[],
+    on_fight: &[],
+    on_play: &[],
+    on_destroyed: &[],
 };
 
 pub static SMAAASH: CardDef = CardDef {
@@ -36,6 +44,10 @@ pub static SMAAASH: CardDef = CardDef {
     bonus_icons: &[BonusIcon::Damage],
     traits: &["Goblin"],
     rarity: Rarity::Rare,
+    on_reap: &[],
+    on_fight: &[],
+    on_play: &[],
+    on_destroyed: &[],
 };
 
 // --- Dis ---
@@ -50,6 +62,10 @@ pub static VEZYMA_THINKDRONE: CardDef = CardDef {
     bonus_icons: &[BonusIcon::Aember],
     traits: &["Human", "Scientist"],
     rarity: Rarity::Common,
+    on_reap: &[Effect::DrawCards(1)],
+    on_fight: &[],
+    on_play: &[],
+    on_destroyed: &[],
 };
 
 pub static PLAGUE: CardDef = CardDef {
@@ -62,6 +78,10 @@ pub static PLAGUE: CardDef = CardDef {
     bonus_icons: &[BonusIcon::Aember],
     traits: &[],
     rarity: Rarity::Uncommon,
+    on_reap: &[],
+    on_fight: &[],
+    on_play: &[Effect::DealDamageToEachEnemy(1)],
+    on_destroyed: &[],
 };
 
 // --- Shadows ---
@@ -76,6 +96,10 @@ pub static SILVERTOOTH: CardDef = CardDef {
     bonus_icons: &[],
     traits: &["Thief"],
     rarity: Rarity::Common,
+    on_reap: &[],
+    on_fight: &[],
+    on_play: &[],
+    on_destroyed: &[],
 };
 
 pub static SHADOW_SELF: CardDef = CardDef {
@@ -88,4 +112,8 @@ pub static SHADOW_SELF: CardDef = CardDef {
     bonus_icons: &[],
     traits: &[],
     rarity: Rarity::Rare,
+    on_reap: &[],
+    on_fight: &[],
+    on_play: &[],
+    on_destroyed: &[],
 };

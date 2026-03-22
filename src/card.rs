@@ -60,6 +60,23 @@ pub enum Keyword {
     Taunt,
 }
 
+/// Triggered ability effects applied when the associated trigger fires.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Effect {
+    /// Controller gains N Aember.
+    GainAember(u32),
+    /// Steal N Aember from opponent into controller's pool.
+    StealAember(u32),
+    /// Capture N Aember from opponent onto this creature.
+    CaptureAember(u32),
+    /// Controller draws N cards.
+    DrawCards(u32),
+    /// Deal N damage to each enemy creature.
+    DealDamageToEachEnemy(u32),
+    /// Heal N damage from this creature.
+    HealSelf(u32),
+}
+
 /// Template for a card — shared across all instances of the same card.
 /// Uses slices so instances can be declared as statics.
 pub struct CardDef {
@@ -72,6 +89,14 @@ pub struct CardDef {
     pub bonus_icons: &'static [BonusIcon],
     pub traits: &'static [&'static str],
     pub rarity: Rarity,
+    /// Effects that fire when this card reaps.
+    pub on_reap: &'static [Effect],
+    /// Effects that fire when this card fights.
+    pub on_fight: &'static [Effect],
+    /// Effects that fire when this card is played.
+    pub on_play: &'static [Effect],
+    /// Effects that fire when this card is destroyed.
+    pub on_destroyed: &'static [Effect],
 }
 
 /// A specific card in a game, with mutable state.
@@ -89,6 +114,8 @@ pub struct Card {
     pub armor_used_this_turn: u32,
     pub armor_bonus: u32,
     pub extra_houses: Vec<House>,
+    /// Elusive: true once the first attack this turn has been absorbed.
+    pub elusive_used_this_turn: bool,
 }
 
 impl Card {
@@ -107,6 +134,7 @@ impl Card {
             armor_used_this_turn: 0,
             armor_bonus: 0,
             extra_houses: Vec::new(),
+            elusive_used_this_turn: false,
         }
     }
 
@@ -152,9 +180,10 @@ impl Card {
         self.damage = 0;
     }
 
-    /// Reset per-turn state (armor usage).
+    /// Reset per-turn state (armor usage, elusive).
     pub fn reset_turn(&mut self) {
         self.armor_used_this_turn = 0;
+        self.elusive_used_this_turn = false;
     }
 
     /// True if this card has the given keyword.
@@ -182,6 +211,10 @@ mod tests {
         bonus_icons: &[],
         traits: &[],
         rarity: Rarity::Common,
+        on_reap: &[],
+        on_fight: &[],
+        on_play: &[],
+        on_destroyed: &[],
     };
 
     static NO_ARMOR_DEF: CardDef = CardDef {
@@ -194,6 +227,10 @@ mod tests {
         bonus_icons: &[],
         traits: &[],
         rarity: Rarity::Common,
+        on_reap: &[],
+        on_fight: &[],
+        on_play: &[],
+        on_destroyed: &[],
     };
 
     static KEYWORD_DEF: CardDef = CardDef {
@@ -206,6 +243,10 @@ mod tests {
         bonus_icons: &[],
         traits: &[],
         rarity: Rarity::Common,
+        on_reap: &[],
+        on_fight: &[],
+        on_play: &[],
+        on_destroyed: &[],
     };
 
     #[test]
@@ -217,6 +258,7 @@ mod tests {
         assert!(c.upgrades.is_empty());
         assert!(!c.stun);
         assert!(!c.ward);
+        assert!(!c.elusive_used_this_turn);
     }
 
     #[test]
@@ -338,5 +380,13 @@ mod tests {
         assert!(c.stun);
         c.stun = false;
         assert!(!c.stun);
+    }
+
+    #[test]
+    fn test_elusive_resets_each_turn() {
+        let mut c = Card::new(1, &NO_ARMOR_DEF);
+        c.elusive_used_this_turn = true;
+        c.reset_turn();
+        assert!(!c.elusive_used_this_turn);
     }
 }

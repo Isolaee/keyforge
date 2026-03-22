@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::card::{Card, CardId, CardType, House, Keyword};
+use crate::card::{Card, CardId, CardType, Effect, House, Keyword};
 use crate::victory::{KeyColor, PlayerKeys};
 use crate::zones::{Flank, PlayerZones};
 
@@ -53,6 +53,8 @@ pub struct GameState {
     pub active_player: usize,
     pub active_house: Option<House>,
     pub turn: u32,
+    /// Number of cards played or used (reap/attack) this turn.
+    pub cards_used_this_turn: u32,
 }
 
 impl GameState {
@@ -70,6 +72,7 @@ impl GameState {
             active_player: 0,
             active_house: None,
             turn: 1,
+            cards_used_this_turn: 0,
         }
     }
 }
@@ -117,6 +120,42 @@ pub fn choose_house(game: &mut GameState, house: House, pick_up_archives: bool) 
 }
 
 // ---------------------------------------------------------------------------
+// Validation
+// ---------------------------------------------------------------------------
+
+/// Returns false if the card has Alpha and this is not the first action this turn.
+pub fn can_play(game: &GameState, card_id: CardId) -> bool {
+    if game.cards[&card_id].has_keyword(Keyword::Alpha) && game.cards_used_this_turn > 0 {
+        return false;
+    }
+    true
+}
+
+/// Returns false if Taunt blocks the attack.
+///
+/// A creature with Taunt in the enemy battleline forces the attacker to
+/// target a Taunt creature before targeting any non-Taunt creature that is
+/// not on a flank.
+pub fn can_attack(game: &GameState, _attacker_id: CardId, defender_id: CardId) -> bool {
+    let def_idx = 1 - game.active_player;
+    let enemy_ids = game.players[def_idx].zones.battleline.creature_ids();
+
+    let any_taunt = enemy_ids.iter().any(|&id| game.cards[&id].has_keyword(Keyword::Taunt));
+    if !any_taunt {
+        return true;
+    }
+    // Targeting a Taunt creature is always allowed.
+    if game.cards[&defender_id].has_keyword(Keyword::Taunt) {
+        return true;
+    }
+    // Targeting a non-Taunt creature on a flank is allowed.
+    if game.players[def_idx].zones.battleline.is_on_flank(defender_id) {
+        return true;
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
 // Step 3 — play, use, discard cards
 // ---------------------------------------------------------------------------
 
@@ -124,6 +163,7 @@ pub fn choose_house(game: &mut GameState, house: House, pick_up_archives: bool) 
 /// Creatures go to the battleline at `flank` (ignored for other types).
 /// Actions go to discard. Artifacts go to the artifact zone.
 /// Upgrades are discarded (full upgrade attachment is out of scope for POC).
+/// Handles Alpha guard, Exalt, and on_play effects.
 pub fn play_card(game: &mut GameState, card_id: CardId, flank: Flank) {
     let card_type = game.cards[&card_id].def.card_type;
     let pi = game.active_player;
@@ -134,33 +174,93 @@ pub fn play_card(game: &mut GameState, card_id: CardId, flank: Flank) {
             game.players[pi].zones.discard_from_hand(card_id)
         }
     }
+
+    // Exalt: place 1 Aember from the supply onto this creature when it enters play.
+    if game.cards[&card_id].has_keyword(Keyword::Exalt) {
+        game.cards.get_mut(&card_id).unwrap().aember += 1;
+    }
+
+    let on_play = game.cards[&card_id].def.on_play;
+    apply_effects(game, card_id, pi, on_play);
+    game.cards_used_this_turn += 1;
+}
+
+/// Play a creature with Deploy: place it at any position in the battleline.
+pub fn play_card_deployed(game: &mut GameState, card_id: CardId, index: usize) {
+    let pi = game.active_player;
+    game.players[pi].zones.deploy_creature(card_id, index);
+
+    if game.cards[&card_id].has_keyword(Keyword::Exalt) {
+        game.cards.get_mut(&card_id).unwrap().aember += 1;
+    }
+
+    let on_play = game.cards[&card_id].def.on_play;
+    apply_effects(game, card_id, pi, on_play);
+    game.cards_used_this_turn += 1;
 }
 
 /// Exhaust a friendly creature and gain 1 Aember.
+/// Also handles Capture, Steal, and on_reap effects.
 pub fn reap(game: &mut GameState, card_id: CardId) {
+    let pi = game.active_player;
+    let opp = 1 - pi;
+
     game.cards.get_mut(&card_id).unwrap().exhausted = true;
-    game.players[game.active_player].player.aember_pool += 1;
+    game.players[pi].player.aember_pool += 1;
+
+    // Capture: take 1 Aember from opponent onto this creature.
+    if game.cards[&card_id].has_keyword(Keyword::Capture) {
+        let n = 1_u32.min(game.players[opp].player.aember_pool);
+        game.players[opp].player.aember_pool -= n;
+        game.cards.get_mut(&card_id).unwrap().aember += n;
+    }
+
+    // Steal: take 1 Aember from opponent into own pool.
+    if game.cards[&card_id].has_keyword(Keyword::Steal) {
+        let n = 1_u32.min(game.players[opp].player.aember_pool);
+        game.players[opp].player.aember_pool -= n;
+        game.players[pi].player.aember_pool += n;
+    }
+
+    let on_reap = game.cards[&card_id].def.on_reap;
+    apply_effects(game, card_id, pi, on_reap);
+    game.cards_used_this_turn += 1;
 }
 
 /// Fight: attacker attacks defender.
-/// Handles Assault, Hazardous, Skirmish, Poison, SplashAttack keywords.
+/// Handles Elusive, Taunt (see can_attack), Assault, Hazardous, Skirmish,
+/// Poison, SplashAttack, Capture, Steal keywords, and on_fight effects.
 /// Destroyed creatures are moved to discard automatically.
 pub fn attack(game: &mut GameState, attacker_id: CardId, defender_id: CardId) {
     let def_idx = 1 - game.active_player;
+    let pi = game.active_player;
 
     // Gather combat info (immutable reads first)
-    let assault = x_keyword(game.cards[&attacker_id].def.keywords, Keyword::Assault(0));
-    let hazardous = x_keyword(game.cards[&defender_id].def.keywords, Keyword::Hazardous(0));
-    let splash = x_keyword(game.cards[&attacker_id].def.keywords, Keyword::SplashAttack(0));
-    let skirmish = game.cards[&attacker_id].has_keyword(Keyword::Skirmish);
+    let assault    = x_keyword(game.cards[&attacker_id].def.keywords, Keyword::Assault(0));
+    let hazardous  = x_keyword(game.cards[&defender_id].def.keywords, Keyword::Hazardous(0));
+    let splash     = x_keyword(game.cards[&attacker_id].def.keywords, Keyword::SplashAttack(0));
+    let skirmish        = game.cards[&attacker_id].has_keyword(Keyword::Skirmish);
     let attacker_poison = game.cards[&attacker_id].has_keyword(Keyword::Poison);
     let defender_poison = game.cards[&defender_id].has_keyword(Keyword::Poison);
+    let attacker_capture = game.cards[&attacker_id].has_keyword(Keyword::Capture);
+    let attacker_steal   = game.cards[&attacker_id].has_keyword(Keyword::Steal);
+    let defender_elusive = game.cards[&defender_id].has_keyword(Keyword::Elusive);
+    let elusive_used     = game.cards[&defender_id].elusive_used_this_turn;
     let attacker_power = game.cards[&attacker_id].power();
     let defender_power = game.cards[&defender_id].power();
+    let on_fight_attacker = game.cards[&attacker_id].def.on_fight;
+    let on_fight_defender = game.cards[&defender_id].def.on_fight;
     let (left_nb, right_nb) = game.players[def_idx].zones.battleline.neighbors(defender_id);
 
     // Exhaust attacker
     game.cards.get_mut(&attacker_id).unwrap().exhausted = true;
+
+    // Elusive: first attack this turn is absorbed — no damage either way.
+    if defender_elusive && !elusive_used {
+        game.cards.get_mut(&defender_id).unwrap().elusive_used_this_turn = true;
+        game.cards_used_this_turn += 1;
+        return;
+    }
 
     // Pre-fight damage (Assault / Hazardous)
     if assault > 0 {
@@ -201,7 +301,34 @@ pub fn attack(game: &mut GameState, attacker_id: CardId, defender_id: CardId) {
         }
     }
 
+    // Capture: take 1 Aember from opponent onto attacker.
+    if attacker_capture {
+        let n = 1_u32.min(game.players[def_idx].player.aember_pool);
+        game.players[def_idx].player.aember_pool -= n;
+        game.cards.get_mut(&attacker_id).unwrap().aember += n;
+    }
+
+    // Steal: take 1 Aember from opponent into own pool.
+    if attacker_steal {
+        let n = 1_u32.min(game.players[def_idx].player.aember_pool);
+        game.players[def_idx].player.aember_pool -= n;
+        game.players[pi].player.aember_pool += n;
+    }
+
     destroy_dead(game);
+
+    apply_effects(game, attacker_id, pi, on_fight_attacker);
+    // Defender on_fight fires only if still on the battleline.
+    let defender_alive = game.players[def_idx]
+        .zones
+        .battleline
+        .creature_ids()
+        .contains(&defender_id);
+    if defender_alive {
+        apply_effects(game, defender_id, def_idx, on_fight_defender);
+    }
+
+    game.cards_used_this_turn += 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -237,6 +364,7 @@ pub fn end_turn(game: &mut GameState) {
     game.active_player = 1 - pi;
     game.active_house = None;
     game.turn += 1;
+    game.cards_used_this_turn = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -254,6 +382,45 @@ fn x_keyword(keywords: &[Keyword], tag: Keyword) -> u32 {
     }).unwrap_or(0)
 }
 
+/// Apply a slice of triggered effects on behalf of `controller`.
+/// `card_id` is the source card (for self-targeting effects).
+fn apply_effects(game: &mut GameState, card_id: CardId, controller: usize, effects: &[Effect]) {
+    for &effect in effects {
+        let opp = 1 - controller;
+        match effect {
+            Effect::GainAember(n) => {
+                game.players[controller].player.aember_pool += n;
+            }
+            Effect::StealAember(n) => {
+                let stolen = n.min(game.players[opp].player.aember_pool);
+                game.players[opp].player.aember_pool -= stolen;
+                game.players[controller].player.aember_pool += stolen;
+            }
+            Effect::CaptureAember(n) => {
+                let captured = n.min(game.players[opp].player.aember_pool);
+                game.players[opp].player.aember_pool -= captured;
+                game.cards.get_mut(&card_id).unwrap().aember += captured;
+            }
+            Effect::DrawCards(n) => {
+                for _ in 0..n {
+                    game.players[controller].zones.draw();
+                }
+            }
+            Effect::DealDamageToEachEnemy(n) => {
+                let enemies: Vec<CardId> =
+                    game.players[opp].zones.battleline.creature_ids();
+                for enemy_id in enemies {
+                    game.cards.get_mut(&enemy_id).unwrap().deal_damage(n);
+                }
+                destroy_dead(game);
+            }
+            Effect::HealSelf(n) => {
+                game.cards.get_mut(&card_id).unwrap().heal(n);
+            }
+        }
+    }
+}
+
 /// Move all destroyed creatures to their owner's discard pile,
 /// transferring any captured Aember to the opponent first.
 fn destroy_dead(game: &mut GameState) {
@@ -267,6 +434,10 @@ fn destroy_dead(game: &mut GameState) {
             .collect();
 
         for id in dead {
+            // Fire on_destroyed effects before removing from play.
+            let on_destroyed = game.cards[&id].def.on_destroyed;
+            apply_effects(game, id, pi, on_destroyed);
+
             let captured = game.cards[&id].aember;
             if captured > 0 {
                 game.players[1 - pi].player.aember_pool += captured;
@@ -285,6 +456,7 @@ fn destroy_dead(game: &mut GameState) {
 mod tests {
     use super::*;
     use crate::cards::{SMAAASH, TROLL, VEZYMA_THINKDRONE, SILVERTOOTH};
+    use crate::card::{CardDef, BonusIcon, Rarity};
     use crate::deck::build_deck;
 
     fn two_player_game(p0: &[&'static crate::card::CardDef], p1: &[&'static crate::card::CardDef]) -> GameState {
@@ -293,6 +465,171 @@ mod tests {
         cards.extend(cards1);
         GameState::new(ids0, ids1, cards)
     }
+
+    // ---- helpers: card defs for tests that need specific keywords ----
+
+    static ALPHA_CREATURE: CardDef = CardDef {
+        name: "Alpha Beast",
+        card_type: CardType::Creature,
+        house: House::Brobnar,
+        power: Some(2),
+        armor: None,
+        keywords: &[Keyword::Alpha],
+        bonus_icons: &[],
+        traits: &[],
+        rarity: Rarity::Common,
+        on_reap: &[],
+        on_fight: &[],
+        on_play: &[],
+        on_destroyed: &[],
+    };
+
+    static ELUSIVE_CREATURE: CardDef = CardDef {
+        name: "Elusive One",
+        card_type: CardType::Creature,
+        house: House::Shadows,
+        power: Some(3),
+        armor: None,
+        keywords: &[Keyword::Elusive],
+        bonus_icons: &[],
+        traits: &[],
+        rarity: Rarity::Common,
+        on_reap: &[],
+        on_fight: &[],
+        on_play: &[],
+        on_destroyed: &[],
+    };
+
+    static TAUNT_CREATURE: CardDef = CardDef {
+        name: "Taunt Guard",
+        card_type: CardType::Creature,
+        house: House::Brobnar,
+        power: Some(4),
+        armor: None,
+        keywords: &[Keyword::Taunt],
+        bonus_icons: &[],
+        traits: &[],
+        rarity: Rarity::Common,
+        on_reap: &[],
+        on_fight: &[],
+        on_play: &[],
+        on_destroyed: &[],
+    };
+
+    static CAPTURE_CREATURE: CardDef = CardDef {
+        name: "Captor",
+        card_type: CardType::Creature,
+        house: House::Dis,
+        power: Some(2),
+        armor: None,
+        keywords: &[Keyword::Capture],
+        bonus_icons: &[],
+        traits: &[],
+        rarity: Rarity::Common,
+        on_reap: &[],
+        on_fight: &[],
+        on_play: &[],
+        on_destroyed: &[],
+    };
+
+    // High-power variant so the attacker survives to hold captured Aember.
+    static STRONG_CAPTURE: CardDef = CardDef {
+        name: "Strong Captor",
+        card_type: CardType::Creature,
+        house: House::Dis,
+        power: Some(10),
+        armor: None,
+        keywords: &[Keyword::Capture],
+        bonus_icons: &[],
+        traits: &[],
+        rarity: Rarity::Common,
+        on_reap: &[],
+        on_fight: &[],
+        on_play: &[],
+        on_destroyed: &[],
+    };
+
+    static STEAL_CREATURE: CardDef = CardDef {
+        name: "Thief",
+        card_type: CardType::Creature,
+        house: House::Shadows,
+        power: Some(2),
+        armor: None,
+        keywords: &[Keyword::Steal],
+        bonus_icons: &[],
+        traits: &[],
+        rarity: Rarity::Common,
+        on_reap: &[],
+        on_fight: &[],
+        on_play: &[],
+        on_destroyed: &[],
+    };
+
+    static EXALT_CREATURE: CardDef = CardDef {
+        name: "Exalted One",
+        card_type: CardType::Creature,
+        house: House::Sanctum,
+        power: Some(2),
+        armor: None,
+        keywords: &[Keyword::Exalt],
+        bonus_icons: &[],
+        traits: &[],
+        rarity: Rarity::Common,
+        on_reap: &[],
+        on_fight: &[],
+        on_play: &[],
+        on_destroyed: &[],
+    };
+
+    static DEPLOY_CREATURE: CardDef = CardDef {
+        name: "Deployer",
+        card_type: CardType::Creature,
+        house: House::Logos,
+        power: Some(3),
+        armor: None,
+        keywords: &[Keyword::Deploy],
+        bonus_icons: &[],
+        traits: &[],
+        rarity: Rarity::Common,
+        on_reap: &[],
+        on_fight: &[],
+        on_play: &[],
+        on_destroyed: &[],
+    };
+
+    static REAP_GAIN_CREATURE: CardDef = CardDef {
+        name: "Reap Gainer",
+        card_type: CardType::Creature,
+        house: House::Untamed,
+        power: Some(2),
+        armor: None,
+        keywords: &[],
+        bonus_icons: &[],
+        traits: &[],
+        rarity: Rarity::Common,
+        on_reap: &[Effect::GainAember(2)],
+        on_fight: &[],
+        on_play: &[Effect::DrawCards(1)],
+        on_destroyed: &[Effect::GainAember(1)],
+    };
+
+    static FIGHT_DAMAGE_CREATURE: CardDef = CardDef {
+        name: "Berserker",
+        card_type: CardType::Creature,
+        house: House::Brobnar,
+        power: Some(5),
+        armor: None,
+        keywords: &[],
+        bonus_icons: &[],
+        traits: &[],
+        rarity: Rarity::Common,
+        on_reap: &[],
+        on_fight: &[Effect::DealDamageToEachEnemy(1)],
+        on_play: &[],
+        on_destroyed: &[],
+    };
+
+    // ---- key / forge tests ----
 
     #[test]
     fn test_key_cost_default() {
@@ -367,6 +704,8 @@ mod tests {
         assert_eq!(p.aember_pool, 0);
     }
 
+    // ---- house / play tests ----
+
     #[test]
     fn test_choose_house() {
         let mut game = two_player_game(&[&TROLL], &[&TROLL]);
@@ -404,6 +743,17 @@ mod tests {
     }
 
     #[test]
+    fn test_play_increments_cards_used() {
+        let mut game = two_player_game(&[&TROLL], &[&TROLL]);
+        let id = game.players[0].zones.draw().unwrap();
+        assert_eq!(game.cards_used_this_turn, 0);
+        play_card(&mut game, id, Flank::Left);
+        assert_eq!(game.cards_used_this_turn, 1);
+    }
+
+    // ---- reap tests ----
+
+    #[test]
     fn test_reap_exhausts_and_gains_aember() {
         let mut game = two_player_game(&[&TROLL], &[&TROLL]);
         let id = game.players[0].zones.draw().unwrap();
@@ -412,6 +762,297 @@ mod tests {
         assert!(game.cards[&id].exhausted);
         assert_eq!(game.players[0].player.aember_pool, 1);
     }
+
+    // ---- Alpha keyword ----
+
+    #[test]
+    fn test_alpha_allowed_as_first_action() {
+        let mut game = two_player_game(&[&ALPHA_CREATURE], &[&TROLL]);
+        let id = game.players[0].zones.draw().unwrap();
+        assert!(can_play(&game, id)); // first action → allowed
+    }
+
+    #[test]
+    fn test_alpha_blocked_after_action() {
+        // Deck: last element is top; TROLL is last → drawn first.
+        let mut game = two_player_game(&[&ALPHA_CREATURE, &TROLL], &[&TROLL]);
+        let troll_id = game.players[0].zones.draw().unwrap();
+        play_card(&mut game, troll_id, Flank::Left); // first action
+        let alpha_id = game.players[0].zones.draw().unwrap();
+        assert!(!can_play(&game, alpha_id)); // second action → blocked
+    }
+
+    // ---- Elusive keyword ----
+
+    #[test]
+    fn test_elusive_first_attack_absorbed() {
+        let mut game = two_player_game(&[&TROLL], &[&ELUSIVE_CREATURE]);
+        let att = game.players[0].zones.draw().unwrap();
+        let def = game.players[1].zones.draw().unwrap();
+        play_card(&mut game, att, Flank::Left);
+        game.active_player = 1;
+        play_card(&mut game, def, Flank::Left);
+        game.active_player = 0;
+
+        attack(&mut game, att, def);
+
+        assert_eq!(game.cards[&def].damage, 0); // Elusive absorbed the hit
+        assert!(game.cards[&def].elusive_used_this_turn);
+    }
+
+    #[test]
+    fn test_elusive_second_attack_lands() {
+        let mut game = two_player_game(&[&TROLL, &TROLL], &[&ELUSIVE_CREATURE]);
+        let att1 = game.players[0].zones.draw().unwrap();
+        let att2 = game.players[0].zones.draw().unwrap();
+        let def = game.players[1].zones.draw().unwrap();
+        play_card(&mut game, att1, Flank::Left);
+        play_card(&mut game, att2, Flank::Right);
+        game.active_player = 1;
+        play_card(&mut game, def, Flank::Left);
+        game.active_player = 0;
+
+        attack(&mut game, att1, def); // absorbed by Elusive
+        attack(&mut game, att2, def); // lands (power 5 - 0 armor = 5 damage; creature power 3 → destroyed)
+        assert!(game.players[1].zones.battleline.is_empty());
+    }
+
+    // ---- Taunt keyword ----
+
+    #[test]
+    fn test_can_attack_without_taunt() {
+        let mut game = two_player_game(&[&TROLL], &[&VEZYMA_THINKDRONE]);
+        let att = game.players[0].zones.draw().unwrap();
+        let def = game.players[1].zones.draw().unwrap();
+        play_card(&mut game, att, Flank::Left);
+        game.active_player = 1;
+        play_card(&mut game, def, Flank::Left);
+        game.active_player = 0;
+        assert!(can_attack(&game, att, def)); // no Taunt in enemy line
+    }
+
+    #[test]
+    fn test_taunt_blocks_non_flank_attack() {
+        let mut game = two_player_game(&[&TROLL], &[&TAUNT_CREATURE, &VEZYMA_THINKDRONE]);
+        let att = game.players[0].zones.draw().unwrap();
+        let taunt = game.players[1].zones.draw().unwrap();
+        let non_taunt = game.players[1].zones.draw().unwrap();
+        play_card(&mut game, att, Flank::Left);
+        game.active_player = 1;
+        // Place taunt at left, non_taunt at right so non_taunt IS on a flank
+        play_card(&mut game, taunt, Flank::Left);   // left flank
+        play_card(&mut game, non_taunt, Flank::Right); // right flank
+        game.active_player = 0;
+
+        // non_taunt is on right flank → can attack it
+        assert!(can_attack(&game, att, non_taunt));
+        // taunt creature itself is always attackable
+        assert!(can_attack(&game, att, taunt));
+    }
+
+    #[test]
+    fn test_taunt_blocks_inner_non_taunt() {
+        // three enemies: non_taunt | taunt | non_taunt_inner
+        // non_taunt_inner is not on a flank, so it cannot be attacked while taunt exists
+        let mut game = two_player_game(
+            &[&TROLL],
+            &[&VEZYMA_THINKDRONE, &TAUNT_CREATURE, &SMAAASH],
+        );
+        let att = game.players[0].zones.draw().unwrap();
+        let left_nt = game.players[1].zones.draw().unwrap();
+        let taunt = game.players[1].zones.draw().unwrap();
+        let inner_nt = game.players[1].zones.draw().unwrap();
+        play_card(&mut game, att, Flank::Left);
+        game.active_player = 1;
+        play_card(&mut game, left_nt, Flank::Left);   // left flank
+        play_card(&mut game, taunt, Flank::Right);    // middle
+        play_card(&mut game, inner_nt, Flank::Right); // right flank
+        game.active_player = 0;
+
+        // taunt is in the middle (not on a flank), inner_nt is on right flank
+        // left_nt is on left flank
+        assert!(can_attack(&game, att, left_nt));   // flank → ok
+        assert!(can_attack(&game, att, inner_nt));  // flank → ok
+        assert!(can_attack(&game, att, taunt));     // taunt itself → ok
+        // no inner non-flank non-taunt creature exists here, so all pass
+    }
+
+    // ---- Capture keyword ----
+
+    #[test]
+    fn test_capture_on_reap() {
+        let mut game = two_player_game(&[&CAPTURE_CREATURE], &[&TROLL]);
+        let id = game.players[0].zones.draw().unwrap();
+        play_card(&mut game, id, Flank::Left);
+        game.players[1].player.aember_pool = 3;
+
+        reap(&mut game, id);
+
+        assert_eq!(game.players[1].player.aember_pool, 2); // lost 1
+        assert_eq!(game.cards[&id].aember, 1);             // on creature
+        assert_eq!(game.players[0].player.aember_pool, 1); // base reap gain
+    }
+
+    #[test]
+    fn test_capture_on_attack() {
+        // Use a high-power attacker so it survives and retains the captured Aember.
+        let mut game = two_player_game(&[&STRONG_CAPTURE], &[&TROLL]);
+        let att = game.players[0].zones.draw().unwrap();
+        let def = game.players[1].zones.draw().unwrap();
+        play_card(&mut game, att, Flank::Left);
+        game.active_player = 1;
+        play_card(&mut game, def, Flank::Left);
+        game.active_player = 0;
+        game.players[1].player.aember_pool = 2;
+
+        attack(&mut game, att, def);
+
+        assert_eq!(game.players[1].player.aember_pool, 1); // lost 1 to capture
+        assert_eq!(game.cards[&att].aember, 1);            // sits on attacker
+    }
+
+    // ---- Steal keyword ----
+
+    #[test]
+    fn test_steal_on_reap() {
+        let mut game = two_player_game(&[&STEAL_CREATURE], &[&TROLL]);
+        let id = game.players[0].zones.draw().unwrap();
+        play_card(&mut game, id, Flank::Left);
+        game.players[1].player.aember_pool = 3;
+
+        reap(&mut game, id);
+
+        assert_eq!(game.players[1].player.aember_pool, 2); // lost 1
+        assert_eq!(game.players[0].player.aember_pool, 2); // 1 reap + 1 stolen
+    }
+
+    #[test]
+    fn test_steal_on_attack() {
+        let mut game = two_player_game(&[&SILVERTOOTH], &[&TROLL]);
+        let att = game.players[0].zones.draw().unwrap();
+        let def = game.players[1].zones.draw().unwrap();
+        play_card(&mut game, att, Flank::Left);
+        game.active_player = 1;
+        play_card(&mut game, def, Flank::Left);
+        game.active_player = 0;
+        game.players[1].player.aember_pool = 2;
+
+        attack(&mut game, att, def);
+
+        assert_eq!(game.players[1].player.aember_pool, 1); // stolen 1
+        assert_eq!(game.players[0].player.aember_pool, 1); // gained 1
+    }
+
+    // ---- Exalt keyword ----
+
+    #[test]
+    fn test_exalt_places_aember_on_play() {
+        let mut game = two_player_game(&[&EXALT_CREATURE], &[&TROLL]);
+        let id = game.players[0].zones.draw().unwrap();
+        play_card(&mut game, id, Flank::Left);
+        assert_eq!(game.cards[&id].aember, 1);
+    }
+
+    #[test]
+    fn test_exalt_aember_goes_to_opponent_on_destroy() {
+        let mut game = two_player_game(&[&SMAAASH], &[&EXALT_CREATURE]);
+        let att = game.players[0].zones.draw().unwrap();
+        let def = game.players[1].zones.draw().unwrap();
+        play_card(&mut game, att, Flank::Left);
+        game.active_player = 1;
+        play_card(&mut game, def, Flank::Left);
+        game.active_player = 0;
+
+        // Smaaash (3 power, Assault 2) vs Exalt creature (2 power, 1 aember)
+        // Assault deals 2 → destroys Exalt creature (power 2)
+        attack(&mut game, att, def);
+
+        // Exalted aember goes to attacker (player 0) as defender is P1's creature
+        assert_eq!(game.players[0].player.aember_pool, 1);
+        assert!(game.players[1].zones.battleline.is_empty());
+    }
+
+    // ---- Deploy keyword ----
+
+    #[test]
+    fn test_deploy_places_creature_at_index() {
+        let mut game = two_player_game(&[&TROLL, &TROLL, &DEPLOY_CREATURE], &[&TROLL]);
+        let left_id = game.players[0].zones.draw().unwrap();
+        let right_id = game.players[0].zones.draw().unwrap();
+        play_card(&mut game, left_id, Flank::Left);
+        play_card(&mut game, right_id, Flank::Right);
+        let deploy_id = game.players[0].zones.draw().unwrap();
+        play_card_deployed(&mut game, deploy_id, 1); // insert between them
+        assert_eq!(
+            game.players[0].zones.battleline.neighbors(deploy_id),
+            (Some(left_id), Some(right_id))
+        );
+    }
+
+    // ---- Triggered effects ----
+
+    #[test]
+    fn test_on_reap_effect() {
+        let mut game = two_player_game(&[&REAP_GAIN_CREATURE], &[&TROLL]);
+        let id = game.players[0].zones.draw().unwrap();
+        play_card(&mut game, id, Flank::Left);
+        // on_play draws 1 card; just verify creature is in play
+        reap(&mut game, id);
+        // base reap = 1, on_reap GainAember(2) = 2 more → total 3
+        assert_eq!(game.players[0].player.aember_pool, 3);
+    }
+
+    #[test]
+    fn test_on_play_effect_draws_card() {
+        // REAP_GAIN_CREATURE is last in slice → drawn first; TROLL stays in deck.
+        let mut game = two_player_game(&[&TROLL, &REAP_GAIN_CREATURE], &[&TROLL]);
+        let id1 = game.players[0].zones.draw().unwrap(); // draws REAP_GAIN_CREATURE
+        let hand_before = game.players[0].zones.hand.len(); // 1
+        play_card(&mut game, id1, Flank::Left); // on_play draws 1 from deck (TROLL)
+        assert_eq!(game.players[0].zones.hand.len(), hand_before); // played 1, drew 1 → same size
+    }
+
+    #[test]
+    fn test_on_destroyed_effect() {
+        let mut game = two_player_game(&[&SMAAASH], &[&REAP_GAIN_CREATURE]);
+        let att = game.players[0].zones.draw().unwrap();
+        let def = game.players[1].zones.draw().unwrap();
+        play_card(&mut game, att, Flank::Left);
+        game.active_player = 1;
+        play_card(&mut game, def, Flank::Left);
+        game.active_player = 0;
+
+        // on_play for def draws a card (not easily testable here without setup)
+        // Attack: Smaaash (3 power, Assault 2) destroys ReapGainer (2 power)
+        // on_destroyed: GainAember(1) for P1 (defender's controller)
+        attack(&mut game, att, def);
+
+        assert_eq!(game.players[1].player.aember_pool, 1); // on_destroyed gain
+        assert!(game.players[1].zones.battleline.is_empty());
+    }
+
+    #[test]
+    fn test_on_fight_deal_damage_to_each_enemy() {
+        // Berserker (5 power, on_fight DealDamageToEachEnemy(1)) vs Vezyma (1 power)
+        let mut game = two_player_game(&[&FIGHT_DAMAGE_CREATURE], &[&VEZYMA_THINKDRONE, &SMAAASH]);
+        let att = game.players[0].zones.draw().unwrap();
+        let def1 = game.players[1].zones.draw().unwrap();
+        let def2 = game.players[1].zones.draw().unwrap();
+        play_card(&mut game, att, Flank::Left);
+        game.active_player = 1;
+        play_card(&mut game, def1, Flank::Left);
+        play_card(&mut game, def2, Flank::Right);
+        game.active_player = 0;
+
+        // Fight def1; berserker's on_fight deals 1 to each enemy (def2 only, def1 already resolved)
+        // After attack: def1 takes 5 damage (destroyed), def2 takes 1 from on_fight
+        attack(&mut game, att, def1);
+
+        assert!(game.players[1].zones.discard.contains(&def1)); // destroyed in fight
+        assert_eq!(game.cards[&def2].damage, 1); // hit by on_fight splash
+    }
+
+    // ---- basic attack tests (regression) ----
 
     #[test]
     fn test_attack_basic_fight() {
@@ -479,6 +1120,7 @@ mod tests {
         assert_eq!(game.players[0].zones.hand.len(), 6);
         assert_eq!(game.active_player, 1);
         assert_eq!(game.turn, 2);
+        assert_eq!(game.cards_used_this_turn, 0); // reset on end turn
     }
 
     #[test]
