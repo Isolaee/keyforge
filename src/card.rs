@@ -1,6 +1,8 @@
+use serde::{Deserialize, Serialize};
+
 pub type CardId = u32;
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub enum House {
     Brobnar,
     Dis,
@@ -18,7 +20,7 @@ pub enum House {
     Untamed,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum CardType {
     Creature,
     Action,
@@ -26,7 +28,7 @@ pub enum CardType {
     Upgrade,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Rarity {
     Common,
     Uncommon,
@@ -35,7 +37,7 @@ pub enum Rarity {
     TokenCreature,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum BonusIcon {
     Aember,
     Capture,
@@ -44,7 +46,7 @@ pub enum BonusIcon {
     Discard,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Keyword {
     Alpha,
     Assault(u32),
@@ -65,7 +67,7 @@ pub enum Keyword {
 }
 
 /// Triggered ability effects applied when the associated trigger fires.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Effect {
     /// Controller gains N Aember.
     GainAember(u32),

@@ -1,15 +1,12 @@
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpStream;
+use std::sync::mpsc;
+
 use macroquad::prelude::*;
 
-mod card;
-mod cards;
-mod deck;
-mod game;
-mod victory;
-mod zones;
-
-use card::{CardId, CardType, House};
-use game::{attack, choose_house, end_turn, play_card, reap, step_forge_key, GameState};
-use zones::Flank;
+use keyforge::card::{CardId, CardType, House};
+use keyforge::protocol::{CardView, ClientGameView, ClientMessage, ServerMessage};
+use keyforge::zones::Flank;
 
 // ---------------------------------------------------------------------------
 // Dynamic layout — recomputed every frame from screen dimensions
@@ -94,35 +91,80 @@ impl L {
 // ---------------------------------------------------------------------------
 
 struct App {
-    game: GameState,
+    view: Option<ClientGameView>,
+    rx: mpsc::Receiver<ServerMessage>,
+    tx_stream: TcpStream,
     selected_hand: Option<CardId>,
     selected_creature: Option<CardId>,
     drag_card: Option<CardId>,
     msg: String,
+    game_over: Option<usize>,
 }
 
 impl App {
-    fn new() -> Self {
-        use cards::*;
-        let p0: &[&'static card::CardDef] = &[
-            &TROLL, &SMAAASH, &SILVERTOOTH, &VEZYMA_THINKDRONE,
-            &PLAGUE, &BANNER_OF_BATTLE, &TROLL, &SMAAASH,
-        ];
-        let p1: &[&'static card::CardDef] = &[
-            &TROLL, &SILVERTOOTH, &SMAAASH, &VEZYMA_THINKDRONE,
-            &PLAGUE, &BANNER_OF_BATTLE, &SILVERTOOTH, &TROLL,
-        ];
-        let (mut all, ids0) = deck::build_deck(p0);
-        let (cards1, ids1) = deck::build_deck(p1);
-        all.extend(cards1);
-        // GameState::new handles setup draw (7 for first player, 6 for second).
-        let g = GameState::new(ids0, ids1, all);
+    fn connect(addr: &str) -> Self {
+        let stream = TcpStream::connect(addr).expect("connect");
+        let reader_stream = stream.try_clone().expect("clone");
+        let tx_stream = stream;
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(reader_stream);
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        if let Ok(msg) = serde_json::from_str::<ServerMessage>(line.trim()) {
+                            if tx.send(msg).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
         Self {
-            game: g,
+            view: None,
+            rx,
+            tx_stream,
             selected_hand: None,
             selected_creature: None,
             drag_card: None,
-            msg: "Your turn. Choose a house to begin.".into(),
+            msg: "Connecting...".into(),
+            game_over: None,
+        }
+    }
+
+    fn send(&self, msg: &ClientMessage) {
+        let mut line = serde_json::to_string(msg).expect("serialize");
+        line.push('\n');
+        let _ = (&self.tx_stream).write_all(line.as_bytes());
+        let _ = (&self.tx_stream).flush();
+    }
+
+    fn poll(&mut self) {
+        while let Ok(msg) = self.rx.try_recv() {
+            match msg {
+                ServerMessage::Welcome { player_index } => {
+                    self.msg = format!("Connected as player {}. Waiting for game state...", player_index);
+                }
+                ServerMessage::GameState(view) => {
+                    self.msg = if view.active_player == view.my_index {
+                        "Your turn. Choose a house.".into()
+                    } else {
+                        "Opponent's turn.".into()
+                    };
+                    self.view = Some(view);
+                }
+                ServerMessage::Error(e) => {
+                    self.msg = format!("Error: {}", e);
+                }
+                ServerMessage::GameOver { winner } => {
+                    self.game_over = Some(winner);
+                }
+            }
         }
     }
 
@@ -130,6 +172,10 @@ impl App {
         self.selected_hand = None;
         self.selected_creature = None;
         self.drag_card = None;
+    }
+
+    fn is_my_turn(&self) -> bool {
+        self.view.as_ref().is_some_and(|v| v.active_player == v.my_index)
     }
 }
 
@@ -158,19 +204,18 @@ fn draw_zone(l: &L, x: f32, y: f32, label: &str, count: usize, highlight: bool) 
     draw_text(&s, x + l.zone_w / 2.0 - s.len() as f32 * fs * 0.5, y + l.ch * 0.6, fs, WHITE);
 }
 
-fn draw_artifact_row(l: &L, game: &GameState, player: usize, y: f32) {
-    let ids = game.players[player].zones.artifacts.clone();
-    let count = ids.len();
-    let bg_base = if player == 0 {
+fn draw_artifact_row(l: &L, artifacts: &[CardView], is_mine: bool, y: f32) {
+    let count = artifacts.len();
+    let bg_base = if is_mine {
         Color::from_rgba(70, 30, 110, 255)
     } else {
         Color::from_rgba(50, 20, 80, 255)
     };
-    for (i, &id) in ids.iter().enumerate() {
+    for (i, card) in artifacts.iter().enumerate() {
         let x = l.blx(i, count);
         draw_rectangle(x, y, l.cw, l.art_h, bg_base);
         draw_rectangle_lines(x, y, l.cw, l.art_h, 2.0, DARKGRAY);
-        let name = game.cards[&id].def.name;
+        let name = &card.name;
         let n = if name.len() > 11 { &name[..11] } else { name };
         draw_text(n, x + 4.0, y + l.art_h * 0.38, l.art_h * 0.28, WHITE);
         draw_text("Artifact", x + 4.0, y + l.art_h * 0.88, l.art_h * 0.22, LIGHTGRAY);
@@ -198,20 +243,22 @@ fn btn(x: f32, y: f32, w: f32, h: f32, label: &str, active: bool,
     click && in_box(mx, my, x, y, w, h)
 }
 
-fn card_sub(game: &GameState, id: CardId) -> String {
-    let c = &game.cards[&id];
-    match c.def.card_type {
-        CardType::Creature => format!("PWR:{} DMG:{}", c.power(), c.damage),
+fn card_sub_view(c: &CardView) -> String {
+    match c.card_type {
+        CardType::Creature => {
+            let base = c.power.unwrap_or(0) as i32;
+            let effective = (base + c.power_counters).max(0) as u32;
+            format!("PWR:{} DMG:{}", effective, c.damage)
+        }
         CardType::Artifact => "Artifact".into(),
         CardType::Action   => "Action".into(),
         CardType::Upgrade  => "Upgrade".into(),
     }
 }
 
-/// True if the active house is set and this card belongs to it.
-fn can_use(game: &GameState, id: CardId) -> bool {
-    match game.active_house {
-        Some(h) => game.cards[&id].belongs_to_house(h),
+fn can_use_card(active_house: Option<House>, card: &CardView) -> bool {
+    match active_house {
+        Some(h) => card.house == h,
         None => false,
     }
 }
@@ -236,12 +283,15 @@ fn window_conf() -> Conf {
 
 #[macroquad::main(window_conf)]
 async fn main() {
-    let mut app = App::new();
+    let addr = std::env::args().nth(1).unwrap_or_else(|| "127.0.0.1:9999".to_string());
+    let mut app = App::connect(&addr);
 
     loop {
+        app.poll();
         clear_background(Color::from_rgba(20, 60, 20, 255));
 
         let l = L::new(screen_width(), screen_height());
+        let lfs = l.ch * 0.11;
 
         let (mx, my) = mouse_position();
         let click    = is_mouse_button_pressed(MouseButton::Left);
@@ -250,8 +300,16 @@ async fn main() {
 
         if rclick { app.deselect(); }
 
-        let ap = app.game.active_player;
-        let lfs = l.ch * 0.11; // label font size
+        let view = match &app.view {
+            Some(v) => v,
+            None => {
+                draw_text(&app.msg, 20.0, 40.0, 20.0, WHITE);
+                next_frame().await;
+                continue;
+            }
+        };
+
+        let my_turn = app.is_my_turn();
 
         // ---- zone labels -----------------------------------------------
         draw_text("OPPONENT  hand",       20.0, l.p1_hand_y - 4.0, lfs, GRAY);
@@ -262,98 +320,96 @@ async fn main() {
         draw_text("YOUR  battleline",     20.0, l.p0_line_y - 4.0, lfs, GRAY);
         draw_text("YOUR  hand",           20.0, l.p0_hand_y - 4.0, lfs, GRAY);
 
-        // ---- P1 hand (face-down) ----------------------------------------
-        for i in 0..app.game.players[1].zones.hand.len() {
+        // ---- Opponent hand (face-down) ----------------------------------
+        for i in 0..view.opp_hand_count {
             draw_card(&l, l.cx(i), l.p1_hand_y,
                 "?", "", Color::from_rgba(25, 25, 80, 255), GRAY);
         }
-        draw_zone(&l, l.deck_x, l.p1_hand_y, "Deck",    app.game.players[1].zones.deck.len(),     false);
-        draw_zone(&l, l.arch_x, l.p1_hand_y, "Archive", app.game.players[1].zones.archives.len(), false);
-        draw_zone(&l, l.disc_x, l.p1_hand_y, "Discard", app.game.players[1].zones.discard.len(),  false);
+        draw_zone(&l, l.deck_x, l.p1_hand_y, "Deck",    view.opp_deck_count,      false);
+        draw_zone(&l, l.arch_x, l.p1_hand_y, "Archive", view.opp_archives_count,   false);
+        draw_zone(&l, l.disc_x, l.p1_hand_y, "Discard", view.opp_discard.len(),    false);
 
-        // ---- P1 battleline ----------------------------------------------
-        let p1_creatures = app.game.players[1].zones.battleline.creature_ids();
-        let p1_count = p1_creatures.len();
-        for (i, &id) in p1_creatures.iter().enumerate() {
-            let x = l.blx(i, p1_count);
-            let exhausted = app.game.cards[&id].exhausted;
-            let selected  = app.selected_creature == Some(id);
-            let bg = if exhausted { Color::from_rgba(70, 15, 15, 255) }
-                     else         { Color::from_rgba(160, 30, 30, 255) };
+        // ---- Opponent battleline ----------------------------------------
+        let opp_count = view.opp_battleline.len();
+        for (i, card) in view.opp_battleline.iter().enumerate() {
+            let x = l.blx(i, opp_count);
+            let selected = app.selected_creature == Some(card.id);
+            let bg = if card.exhausted { Color::from_rgba(70, 15, 15, 255) }
+                     else              { Color::from_rgba(160, 30, 30, 255) };
             let border = if selected { YELLOW } else { DARKGRAY };
-            draw_card(&l, x, l.p1_line_y, app.game.cards[&id].def.name,
-                &card_sub(&app.game, id), bg, border);
+            draw_card(&l, x, l.p1_line_y, &card.name,
+                &card_sub_view(card), bg, border);
             if i == 0 {
                 draw_flank_badge(&l, x, l.p1_line_y, "◄L", Color::from_rgba(255, 160, 160, 255));
             }
-            if i == p1_count - 1 {
+            if i == opp_count - 1 {
                 draw_flank_badge(&l, x + l.cw - l.cw * 0.26, l.p1_line_y,
                     "R►", Color::from_rgba(255, 160, 160, 255));
             }
             if click && l.hit(mx, my, x, l.p1_line_y) {
                 if let Some(att) = app.selected_creature {
-                    let own = app.game.players[0].zones.battleline.creature_ids();
-                    if own.contains(&att) && ap == 0 {
-                        attack(&mut app.game, att, id);
+                    let own_ids: Vec<CardId> = view.my_battleline.iter().map(|c| c.id).collect();
+                    if own_ids.contains(&att) && my_turn {
+                        app.send(&ClientMessage::Attack {
+                            attacker_id: att,
+                            defender_id: card.id,
+                        });
                         app.selected_creature = None;
-                        app.msg = "Attacked!".into();
+                        app.msg = "Attack sent.".into();
                     }
                 }
             }
         }
 
-        // ---- P1 artifacts -----------------------------------------------
-        draw_artifact_row(&l, &app.game, 1, l.p1_art_y);
+        // ---- Opponent artifacts -----------------------------------------
+        draw_artifact_row(&l, &view.opp_artifacts, false, l.p1_art_y);
 
-        // ---- P0 battleline ----------------------------------------------
-        let p0_creatures = app.game.players[0].zones.battleline.creature_ids();
-        let p0_count = p0_creatures.len();
-        for (i, &id) in p0_creatures.iter().enumerate() {
-            let x = l.blx(i, p0_count);
-            let exhausted = app.game.cards[&id].exhausted;
-            let selected  = app.selected_creature == Some(id);
-            let bg = if exhausted { Color::from_rgba(15, 60, 15, 255) }
-                     else         { Color::from_rgba(25, 130, 25, 255) };
+        // ---- Own battleline ---------------------------------------------
+        let my_count = view.my_battleline.len();
+        for (i, card) in view.my_battleline.iter().enumerate() {
+            let x = l.blx(i, my_count);
+            let selected = app.selected_creature == Some(card.id);
+            let bg = if card.exhausted { Color::from_rgba(15, 60, 15, 255) }
+                     else              { Color::from_rgba(25, 130, 25, 255) };
             let border = if selected { YELLOW } else { DARKGRAY };
-            draw_card(&l, x, l.p0_line_y, app.game.cards[&id].def.name,
-                &card_sub(&app.game, id), bg, border);
+            draw_card(&l, x, l.p0_line_y, &card.name,
+                &card_sub_view(card), bg, border);
             if i == 0 {
                 draw_flank_badge(&l, x, l.p0_line_y, "◄L", Color::from_rgba(160, 255, 160, 255));
             }
-            if i == p0_count - 1 {
+            if i == my_count - 1 {
                 draw_flank_badge(&l, x + l.cw - l.cw * 0.26, l.p0_line_y,
                     "R►", Color::from_rgba(160, 255, 160, 255));
             }
-            if click && l.hit(mx, my, x, l.p0_line_y) && ap == 0 {
-                if app.game.active_house.is_none() {
+            if click && l.hit(mx, my, x, l.p0_line_y) && my_turn {
+                if view.active_house.is_none() {
                     app.msg = "Choose a house first.".into();
-                } else if !can_use(&app.game, id) {
+                } else if !can_use_card(view.active_house, card) {
                     app.msg = format!(
                         "{} is not a {:?} card — choose its house to use it.",
-                        app.game.cards[&id].def.name, app.game.cards[&id].def.house);
+                        card.name, card.house);
                 } else if selected {
-                    if !app.game.cards[&id].exhausted {
-                        reap(&mut app.game, id);
+                    if !card.exhausted {
+                        app.send(&ClientMessage::Reap { card_id: card.id });
                         app.selected_creature = None;
-                        app.msg = "Reaped! +1 Aember.".into();
+                        app.msg = "Reap sent.".into();
                     }
                 } else {
-                    app.selected_creature = Some(id);
+                    app.selected_creature = Some(card.id);
                     app.selected_hand = None;
                     app.msg = "Creature selected — click again to reap, click enemy to attack.".into();
                 }
             }
         }
 
-        // ---- P0 artifacts -----------------------------------------------
-        draw_artifact_row(&l, &app.game, 0, l.p0_art_y);
+        // ---- Own artifacts ----------------------------------------------
+        draw_artifact_row(&l, &view.my_artifacts, true, l.p0_art_y);
 
-        // ---- play drop-zones (shown when dragging or a hand card is selected) ---
-        let active_card = app.selected_hand.or(app.drag_card);
-        if active_card.is_some() {
-            let is_artifact = active_card
-                .map(|id| app.game.cards[&id].def.card_type == CardType::Artifact)
-                .unwrap_or(false);
+        // ---- play drop-zones --------------------------------------------
+        let active_card_id = app.selected_hand.or(app.drag_card);
+        if active_card_id.is_some() {
+            let find_card = active_card_id.and_then(|id| view.my_hand.iter().find(|c| c.id == id));
+            let is_artifact = find_card.is_some_and(|c| c.card_type == CardType::Artifact);
 
             let art_zone_w = l.panel_x - 40.0;
             let flank_zy   = l.p0_line_y - l.ch * 0.26;
@@ -386,53 +442,38 @@ async fn main() {
                 let on_right = in_box(mx, my, rx, flank_zy, half, flank_zh);
                 let flank = if on_left  { Some(Flank::Left) }
                        else if on_right { Some(Flank::Right) }
-                       else if on_art   { Some(Flank::Right) } // flank ignored for artifacts
+                       else if on_art   { Some(Flank::Right) }
                        else             { None };
                 if let (Some(flank), Some(id)) = (flank, app.selected_hand) {
-                    if app.game.active_house.is_none() {
-                        app.msg = "Choose a house first.".into();
-                    } else if !can_use(&app.game, id) {
-                        app.msg = format!(
-                            "{} is not a {:?} card — choose its house to play it.",
-                            app.game.cards[&id].def.name, app.game.cards[&id].def.house);
-                    } else {
-                        let ct = app.game.cards[&id].def.card_type;
-                        play_card(&mut app.game, id, flank);
-                        app.selected_hand = None;
-                        app.msg = match ct {
-                            CardType::Creature => "Creature played.".into(),
-                            CardType::Artifact => "Artifact played.".into(),
-                            CardType::Action   => "Action played — card goes to discard.".into(),
-                            CardType::Upgrade  => "Upgrade played.".into(),
-                        };
-                    }
+                    app.send(&ClientMessage::PlayCard { card_id: id, flank });
+                    app.selected_hand = None;
+                    app.msg = "Play sent.".into();
                 }
             }
         }
 
-        // ---- P0 hand ----------------------------------------------------
-        let p0_hand: Vec<CardId> = app.game.players[0].zones.hand.clone();
-        for (i, &id) in p0_hand.iter().enumerate() {
-            let selected = app.selected_hand == Some(id);
-            let playable = can_use(&app.game, id);
+        // ---- Own hand ---------------------------------------------------
+        for (i, card) in view.my_hand.iter().enumerate() {
+            let selected = app.selected_hand == Some(card.id);
+            let playable = can_use_card(view.active_house, card);
             let bg = if selected        { Color::from_rgba(180, 140, 0, 255) }
                      else if playable   { Color::from_rgba(30, 60, 160, 255) }
                      else               { Color::from_rgba(20, 20, 50, 255) };
             let border = if selected { WHITE } else if playable { GRAY } else { DARKGRAY };
             draw_card(&l, l.cx(i), l.p0_hand_y,
-                app.game.cards[&id].def.name, &card_sub(&app.game, id), bg, border);
-            if click && l.hit(mx, my, l.cx(i), l.p0_hand_y) && ap == 0 {
-                app.drag_card = Some(id);
+                &card.name, &card_sub_view(card), bg, border);
+            if click && l.hit(mx, my, l.cx(i), l.p0_hand_y) && my_turn {
+                app.drag_card = Some(card.id);
                 app.selected_hand = None;
                 app.selected_creature = None;
             }
         }
 
-        // ---- P0 side zones ----------------------------------------------
-        let dragging_p0 = app.drag_card.is_some() && ap == 0;
-        draw_zone(&l, l.deck_x, l.p0_hand_y, "Deck",    app.game.players[0].zones.deck.len(),     false);
-        draw_zone(&l, l.arch_x, l.p0_hand_y, "Archive", app.game.players[0].zones.archives.len(), false);
-        draw_zone(&l, l.disc_x, l.p0_hand_y, "Discard", app.game.players[0].zones.discard.len(),  dragging_p0);
+        // ---- Own side zones ---------------------------------------------
+        let dragging_mine = app.drag_card.is_some() && my_turn;
+        draw_zone(&l, l.deck_x, l.p0_hand_y, "Deck",    view.my_deck_count,         false);
+        draw_zone(&l, l.arch_x, l.p0_hand_y, "Archive", view.my_archives.len(),     false);
+        draw_zone(&l, l.disc_x, l.p0_hand_y, "Discard", view.my_discard.len(),      dragging_mine);
 
         // ================================================================
         // Right panel
@@ -443,10 +484,11 @@ async fn main() {
 
         let px = l.panel_x + 8.0;
 
-        draw_text(&format!("Turn {}", app.game.turn), px, 28.0, 20.0, WHITE);
-        draw_text(&format!("Active: P{}", ap),        px, 50.0, 16.0, LIGHTGRAY);
+        draw_text(&format!("Turn {}", view.turn), px, 28.0, 20.0, WHITE);
+        let active_lbl = if my_turn { "You" } else { "Opponent" };
+        draw_text(&format!("Active: {}", active_lbl), px, 50.0, 16.0, LIGHTGRAY);
 
-        let ah_lbl = match app.game.active_house {
+        let ah_lbl = match view.active_house {
             Some(House::Brobnar) => "Brobnar",
             Some(House::Dis)     => "Dis",
             Some(House::Shadows) => "Shadows",
@@ -455,13 +497,16 @@ async fn main() {
         draw_text(&format!("House:  {}", ah_lbl), px, 70.0, 16.0, LIGHTGRAY);
         draw_line(l.panel_x, 80.0, sw, 80.0, 1.0, DARKGRAY);
 
-        draw_text("P0 (You)", px, 100.0, 15.0, GREEN);
-        draw_text(&format!("Aember: {}", app.game.players[0].player.aember_pool), px, 118.0, 14.0, GOLD);
-        draw_text(&format!("Keys:   {}/3", app.game.players[0].player.keys.forged_count()), px, 134.0, 14.0, GOLD);
+        let my_keys = view.my_player.keys.iter().filter(|k| k.forged).count();
+        let opp_keys = view.opp_player.keys.iter().filter(|k| k.forged).count();
 
-        draw_text("P1 (Opp)", px, 155.0, 15.0, RED);
-        draw_text(&format!("Aember: {}", app.game.players[1].player.aember_pool), px, 173.0, 14.0, ORANGE);
-        draw_text(&format!("Keys:   {}/3", app.game.players[1].player.keys.forged_count()), px, 189.0, 14.0, ORANGE);
+        draw_text("You", px, 100.0, 15.0, GREEN);
+        draw_text(&format!("Aember: {}", view.my_player.aember_pool), px, 118.0, 14.0, GOLD);
+        draw_text(&format!("Keys:   {}/3", my_keys), px, 134.0, 14.0, GOLD);
+
+        draw_text("Opponent", px, 155.0, 15.0, RED);
+        draw_text(&format!("Aember: {}", view.opp_player.aember_pool), px, 173.0, 14.0, ORANGE);
+        draw_text(&format!("Keys:   {}/3", opp_keys), px, 189.0, 14.0, ORANGE);
 
         draw_line(l.panel_x, 202.0, sw, 202.0, 1.0, DARKGRAY);
 
@@ -469,21 +514,21 @@ async fn main() {
         let houses = [(House::Brobnar, "Brobnar"), (House::Dis, "Dis"), (House::Shadows, "Shadows")];
         for (i, (h, label)) in houses.iter().enumerate() {
             let by = 228.0 + i as f32 * 42.0;
-            let active = app.game.active_house == Some(*h);
-            if btn(px, by, 128.0, 32.0, label, active, mx, my, click) && ap == 0 {
-                choose_house(&mut app.game, *h, false);
+            let active = view.active_house == Some(*h);
+            if btn(px, by, 128.0, 32.0, label, active, mx, my, click) && my_turn {
+                app.send(&ClientMessage::ChooseHouse { house: *h, pick_up_archives: false });
                 app.msg = format!("House {} chosen.", label);
             }
         }
 
         draw_line(l.panel_x, 360.0, sw, 360.0, 1.0, DARKGRAY);
 
-        if btn(px, 370.0, 128.0, 36.0, "End Turn", false, mx, my, click) {
-            end_turn(&mut app.game);
-            let new_ap = app.game.active_player;
-            step_forge_key(&mut app.game.players[new_ap].player);
-            app.deselect();
-            app.msg = format!("P{} to play. Choose a house.", new_ap);
+        if btn(px, 370.0, 128.0, 36.0, "End Turn", false, mx, my, click) && my_turn {
+            app.send(&ClientMessage::EndTurn);
+            app.selected_hand = None;
+            app.selected_creature = None;
+            app.drag_card = None;
+            app.msg = "End turn sent.".into();
         }
 
         draw_line(l.panel_x, 416.0, sw, 416.0, 1.0, DARKGRAY);
@@ -497,24 +542,24 @@ async fn main() {
         draw_text("R-click           clear",  px, 582.0, 12.0, DARKGRAY);
 
         // ---- win overlay ------------------------------------------------
-        let p0_won = app.game.players[0].player.keys.has_won();
-        let p1_won = app.game.players[1].player.keys.has_won();
-        if p0_won || p1_won {
+        if let Some(winner) = app.game_over {
             let ow = l.panel_x * 0.7;
             let ox = (l.panel_x - ow) / 2.0;
             let oy = sh / 2.0 - 65.0;
             draw_rectangle(ox, oy, ow, 130.0, Color::from_rgba(0, 0, 0, 210));
-            let (txt, col) = if p0_won { ("PLAYER 0 WINS!", GOLD) } else { ("PLAYER 1 WINS!", RED) };
+            let is_me = view.my_index == winner;
+            let (txt, col) = if is_me { ("YOU WIN!", GOLD) } else { ("YOU LOSE!", RED) };
             draw_text(txt, ox + 20.0, oy + 80.0, l.ch * 0.62, col);
         }
 
         // ---- drag ghost -------------------------------------------------
         if let Some(drag_id) = app.drag_card {
             if is_mouse_button_down(MouseButton::Left) {
-                let name = app.game.cards[&drag_id].def.name;
-                let sub  = card_sub(&app.game, drag_id);
-                draw_card(&l, mx - l.cw / 2.0, my - l.ch / 2.0, name, &sub,
-                    Color::from_rgba(200, 180, 60, 210), WHITE);
+                if let Some(card) = view.my_hand.iter().find(|c| c.id == drag_id) {
+                    draw_card(&l, mx - l.cw / 2.0, my - l.ch / 2.0,
+                        &card.name, &card_sub_view(card),
+                        Color::from_rgba(200, 180, 60, 210), WHITE);
+                }
             }
         }
 
@@ -528,43 +573,18 @@ async fn main() {
                 let lx         = 20.0;
                 let rx         = lx + half + 10.0;
 
-                let on_discard    = in_box(mx, my, l.disc_x, l.p0_hand_y, l.zone_w, l.ch) && ap == 0;
+                let on_discard    = in_box(mx, my, l.disc_x, l.p0_hand_y, l.zone_w, l.ch) && my_turn;
                 let on_artifact   = in_box(mx, my, 20.0, l.p0_art_y, art_zone_w, l.art_h);
                 let on_left_flank = in_box(mx, my, lx, flank_zy, half, flank_zh);
                 let on_right_flank= in_box(mx, my, rx, flank_zy, half, flank_zh);
-                let drag_type     = app.game.cards[&drag_id].def.card_type;
 
                 if on_discard {
-                    app.game.players[ap].zones.discard_from_hand(drag_id);
-                    app.msg = "Card discarded.".into();
-                } else if on_artifact && drag_type == CardType::Artifact {
-                    if app.game.active_house.is_none() {
-                        app.msg = "Choose a house first.".into();
-                    } else if !can_use(&app.game, drag_id) {
-                        app.msg = format!(
-                            "{} is not a {:?} card — choose its house to play it.",
-                            app.game.cards[&drag_id].def.name, app.game.cards[&drag_id].def.house);
-                    } else {
-                        play_card(&mut app.game, drag_id, Flank::Right);
-                        app.msg = "Artifact played.".into();
-                    }
-                } else if on_left_flank || on_right_flank {
+                    app.send(&ClientMessage::DiscardFromHand { card_id: drag_id });
+                    app.msg = "Discard sent.".into();
+                } else if on_artifact || on_left_flank || on_right_flank {
                     let flank = if on_left_flank { Flank::Left } else { Flank::Right };
-                    if app.game.active_house.is_none() {
-                        app.msg = "Choose a house first.".into();
-                    } else if !can_use(&app.game, drag_id) {
-                        app.msg = format!(
-                            "{} is not a {:?} card — choose its house to play it.",
-                            app.game.cards[&drag_id].def.name, app.game.cards[&drag_id].def.house);
-                    } else {
-                        play_card(&mut app.game, drag_id, flank);
-                        app.msg = match drag_type {
-                            CardType::Creature => "Creature played.".into(),
-                            CardType::Artifact => "Artifact played.".into(),
-                            CardType::Action   => "Action played — card goes to discard.".into(),
-                            CardType::Upgrade  => "Upgrade played.".into(),
-                        };
-                    }
+                    app.send(&ClientMessage::PlayCard { card_id: drag_id, flank });
+                    app.msg = "Play sent.".into();
                 } else {
                     app.selected_hand = Some(drag_id);
                     app.msg = "Card selected — drop in a zone to play or discard.".into();

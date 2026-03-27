@@ -1,7 +1,10 @@
 use std::collections::VecDeque;
 
+use serde::{Deserialize, Serialize};
+
 use crate::card::CardId;
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum Flank {
     Left,
     Right,

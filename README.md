@@ -4,7 +4,7 @@ A hobby project — a digital client for the [KeyForge](https://www.keyforgegame
 
 ## Features
 
-- Two-player local gameplay on a shared screen
+- Two-player client-server gameplay over TCP
 - Turn-based game loop: choose a house, take actions, end turn
 - Three houses playable: Brobnar, Dis, Shadows
 - Card types: Creatures, Actions, Artifacts, Upgrades
@@ -35,8 +35,23 @@ A hobby project — a digital client for the [KeyForge](https://www.keyforgegame
 
 ## Running
 
+Start the server (waits for 2 client connections):
+
 ```sh
-cargo run
+cargo run --bin server
+```
+
+Optionally pass a bind address (default `127.0.0.1:9999`):
+
+```sh
+cargo run --bin server -- 0.0.0.0:9999
+```
+
+Then launch two clients (each in its own terminal):
+
+```sh
+cargo run                          # connects to 127.0.0.1:9999
+cargo run -- 192.168.1.10:9999    # or specify a remote address
 ```
 
 ## Building
@@ -44,6 +59,8 @@ cargo run
 ```sh
 cargo build --release
 ```
+
+Produces two binaries: `target/release/keyforge` (client) and `target/release/server`.
 
 ## Testing
 
@@ -66,17 +83,29 @@ cargo test
 | Right-click | Deselect |
 | End Turn button | Pass turn to opponent |
 
+## Architecture
+
+The game uses a client-server model over TCP with newline-delimited JSON messages.
+
+- **Server** owns the authoritative `GameState`, validates all actions, and broadcasts a filtered `ClientGameView` to each player after every move. Opponent hand contents and archive contents are hidden (only counts are sent).
+- **Client** renders the `ClientGameView` it receives and sends `ClientMessage` actions (choose house, play card, reap, attack, end turn, etc.) to the server.
+
 ## Project structure
 
 ```
 src/
-  main.rs    — window, rendering, input handling
-  game.rs    — game state, turn logic, actions
-  card.rs    — card data model, keywords, effects
-  cards.rs   — static card definitions
-  deck.rs    — deck construction
-  zones.rs   — player zones (hand, deck, battleline, etc.)
-  victory.rs — win condition (3 keys forged)
+  lib.rs       — shared library root (re-exports all modules)
+  main.rs      — GUI client (macroquad) — connects to server over TCP
+  bin/
+    server.rs  — TCP server — accepts 2 players, runs game loop
+  game.rs      — game state, turn logic, actions
+  card.rs      — card data model, keywords, effects
+  cards.rs     — static card definitions
+  deck.rs      — deck construction
+  zones.rs     — player zones (hand, deck, battleline, etc.)
+  victory.rs   — win condition (3 keys forged)
+  protocol.rs  — ClientMessage, ServerMessage, ClientGameView (serde)
+  view.rs      — converts GameState into a filtered ClientGameView
 ```
 
 ## Notes
