@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::card::{Card, CardId, CardType, Effect, House, Keyword};
+use crate::card::{BonusIcon, Card, CardId, CardType, Effect, House, Keyword};
 use crate::victory::{KeyColor, PlayerKeys};
 use crate::zones::{Flank, PlayerZones};
 
@@ -12,6 +12,8 @@ pub struct Player {
     pub aember_pool: u32,
     pub keys: PlayerKeys,
     pub key_cost_modifier: i32,
+    /// Current chain count. Reduces hand refill size by 1 per 6 chains.
+    pub chains: u32,
 }
 
 impl Player {
@@ -20,6 +22,7 @@ impl Player {
             aember_pool: 0,
             keys: PlayerKeys::new(),
             key_cost_modifier: 0,
+            chains: 0,
         }
     }
 
@@ -53,8 +56,14 @@ pub struct GameState {
     pub active_player: usize,
     pub active_house: Option<House>,
     pub turn: u32,
+    /// Index of the player who goes first (subject to First Turn Rule).
+    pub first_player: usize,
     /// Number of cards played or used (reap/attack) this turn.
     pub cards_used_this_turn: u32,
+    /// Tracks how many times each card name has been played/used this turn (Rule of Six).
+    pub card_use_counts: HashMap<&'static str, u32>,
+    /// Set when an Omega card is played; blocks further plays this step.
+    pub omega_triggered: bool,
 }
 
 impl GameState {
@@ -72,7 +81,10 @@ impl GameState {
             active_player: 0,
             active_house: None,
             turn: 1,
+            first_player: 0,
             cards_used_this_turn: 0,
+            card_use_counts: HashMap::new(),
+            omega_triggered: false,
         }
     }
 }
@@ -123,12 +135,88 @@ pub fn choose_house(game: &mut GameState, house: House, pick_up_archives: bool) 
 // Validation
 // ---------------------------------------------------------------------------
 
-/// Returns false if the card has Alpha and this is not the first action this turn.
+/// Returns false if the card cannot be played this turn.
+/// Checks: Omega lockout, First Turn Rule, Alpha, Rule of Six.
 pub fn can_play(game: &GameState, card_id: CardId) -> bool {
+    if game.omega_triggered {
+        return false;
+    }
+    // First Turn Rule: first player's first turn may only play/discard one card.
+    if game.turn == 1
+        && game.active_player == game.first_player
+        && game.cards_used_this_turn >= 1
+    {
+        return false;
+    }
     if game.cards[&card_id].has_keyword(Keyword::Alpha) && game.cards_used_this_turn > 0 {
         return false;
     }
+    // Rule of Six: same card name cannot be played/used more than 6 times per turn.
+    let name = game.cards[&card_id].def.name;
+    if *game.card_use_counts.get(name).unwrap_or(&0) >= 6 {
+        return false;
+    }
     true
+}
+
+/// Returns true if the card belongs to the active house, or has Versatile.
+pub fn is_active_house_card(game: &GameState, card_id: CardId) -> bool {
+    let card = &game.cards[&card_id];
+    if card.has_keyword(Keyword::Versatile) {
+        return true;
+    }
+    match game.active_house {
+        Some(house) => card.belongs_to_house(house),
+        None => false,
+    }
+}
+
+/// Returns false if the creature is exhausted, stunned, or enraged with enemies present.
+pub fn can_reap(game: &GameState, card_id: CardId) -> bool {
+    let card = &game.cards[&card_id];
+    if card.exhausted || card.stun {
+        return false;
+    }
+    // Enraged creatures must fight if enemy creatures exist.
+    if card.enrage {
+        let opp = 1 - game.active_player;
+        if !game.players[opp].zones.battleline.is_empty() {
+            return false;
+        }
+    }
+    let name = card.def.name;
+    *game.card_use_counts.get(name).unwrap_or(&0) < 6
+}
+
+/// Returns false if the creature is exhausted or stunned.
+pub fn can_fight_with(game: &GameState, card_id: CardId) -> bool {
+    let card = &game.cards[&card_id];
+    if card.exhausted || card.stun {
+        return false;
+    }
+    let name = card.def.name;
+    *game.card_use_counts.get(name).unwrap_or(&0) < 6
+}
+
+/// Use a stunned creature: exhaust it and remove its stun counter.
+/// This counts as using the creature for Rule of Six purposes.
+pub fn unstun(game: &mut GameState, card_id: CardId) {
+    let card = game.cards.get_mut(&card_id).unwrap();
+    card.stun = false;
+    card.exhausted = true;
+    let name = card.def.name;
+    *game.card_use_counts.entry(name).or_insert(0) += 1;
+    game.cards_used_this_turn += 1;
+}
+
+/// Discard a card from the active player's hand (Step 3 discard action).
+pub fn discard_card_from_hand(game: &mut GameState, card_id: CardId) {
+    let pi = game.active_player;
+    game.players[pi].zones.hand.retain(|&id| id != card_id);
+    game.players[pi].zones.discard.push(card_id);
+    let name = game.cards[&card_id].def.name;
+    *game.card_use_counts.entry(name).or_insert(0) += 1;
+    game.cards_used_this_turn += 1;
 }
 
 /// Returns false if Taunt blocks the attack.
@@ -163,17 +251,23 @@ pub fn can_attack(game: &GameState, _attacker_id: CardId, defender_id: CardId) -
 /// Creatures go to the battleline at `flank` (ignored for other types).
 /// Actions go to discard. Artifacts go to the artifact zone.
 /// Upgrades are discarded (full upgrade attachment is out of scope for POC).
-/// Handles Alpha guard, Exalt, and on_play effects.
+/// Handles Treachery, bonus icons, Exalt, on_play effects, Omega, and Rule of Six.
 pub fn play_card(game: &mut GameState, card_id: CardId, flank: Flank) {
     let card_type = game.cards[&card_id].def.card_type;
     let pi = game.active_player;
+    // Treachery: creature enters play under opponent's control.
+    let has_treachery = game.cards[&card_id].has_keyword(Keyword::Treachery);
+    let owner = if has_treachery { 1 - pi } else { pi };
     match card_type {
-        CardType::Creature => game.players[pi].zones.play_creature(card_id, flank),
-        CardType::Artifact => game.players[pi].zones.play_artifact(card_id),
+        CardType::Creature => game.players[owner].zones.play_creature(card_id, flank),
+        CardType::Artifact => game.players[owner].zones.play_artifact(card_id),
         CardType::Action | CardType::Upgrade => {
             game.players[pi].zones.discard_from_hand(card_id)
         }
     }
+
+    // Bonus icons resolve before Play: abilities.
+    resolve_bonus_icons(game, card_id, pi);
 
     // Exalt: place 1 Aember from the supply onto this creature when it enters play.
     if game.cards[&card_id].has_keyword(Keyword::Exalt) {
@@ -182,13 +276,25 @@ pub fn play_card(game: &mut GameState, card_id: CardId, flank: Flank) {
 
     let on_play = game.cards[&card_id].def.on_play;
     apply_effects(game, card_id, pi, on_play);
+
+    // Omega: no more cards can be played/used/discarded this step.
+    if game.cards[&card_id].has_keyword(Keyword::Omega) {
+        game.omega_triggered = true;
+    }
+
+    let name = game.cards[&card_id].def.name;
+    *game.card_use_counts.entry(name).or_insert(0) += 1;
     game.cards_used_this_turn += 1;
 }
 
 /// Play a creature with Deploy: place it at any position in the battleline.
 pub fn play_card_deployed(game: &mut GameState, card_id: CardId, index: usize) {
     let pi = game.active_player;
-    game.players[pi].zones.deploy_creature(card_id, index);
+    let has_treachery = game.cards[&card_id].has_keyword(Keyword::Treachery);
+    let owner = if has_treachery { 1 - pi } else { pi };
+    game.players[owner].zones.deploy_creature(card_id, index);
+
+    resolve_bonus_icons(game, card_id, pi);
 
     if game.cards[&card_id].has_keyword(Keyword::Exalt) {
         game.cards.get_mut(&card_id).unwrap().aember += 1;
@@ -196,6 +302,13 @@ pub fn play_card_deployed(game: &mut GameState, card_id: CardId, index: usize) {
 
     let on_play = game.cards[&card_id].def.on_play;
     apply_effects(game, card_id, pi, on_play);
+
+    if game.cards[&card_id].has_keyword(Keyword::Omega) {
+        game.omega_triggered = true;
+    }
+
+    let name = game.cards[&card_id].def.name;
+    *game.card_use_counts.entry(name).or_insert(0) += 1;
     game.cards_used_this_turn += 1;
 }
 
@@ -224,6 +337,8 @@ pub fn reap(game: &mut GameState, card_id: CardId) {
 
     let on_reap = game.cards[&card_id].def.on_reap;
     apply_effects(game, card_id, pi, on_reap);
+    let name = game.cards[&card_id].def.name;
+    *game.card_use_counts.entry(name).or_insert(0) += 1;
     game.cards_used_this_turn += 1;
 }
 
@@ -317,8 +432,11 @@ pub fn attack(game: &mut GameState, attacker_id: CardId, defender_id: CardId) {
 
     destroy_dead(game);
 
-    apply_effects(game, attacker_id, pi, on_fight_attacker);
-    // Defender on_fight fires only if still on the battleline.
+    // After Fight: abilities only resolve if the creature survived the fight.
+    let attacker_alive = game.players[pi].zones.battleline.creature_ids().contains(&attacker_id);
+    if attacker_alive {
+        apply_effects(game, attacker_id, pi, on_fight_attacker);
+    }
     let defender_alive = game.players[def_idx]
         .zones
         .battleline
@@ -328,6 +446,8 @@ pub fn attack(game: &mut GameState, attacker_id: CardId, defender_id: CardId) {
         apply_effects(game, defender_id, def_idx, on_fight_defender);
     }
 
+    let name = game.cards[&attacker_id].def.name;
+    *game.card_use_counts.entry(name).or_insert(0) += 1;
     game.cards_used_this_turn += 1;
 }
 
@@ -354,22 +474,93 @@ pub fn end_turn(game: &mut GameState) {
         }
     }
 
-    // Draw up to 6
-    while game.players[pi].zones.hand.len() < 6 {
+    // Chains reduce the hand refill target (shed 1 chain if they reduced a draw).
+    let chains = game.players[pi].player.chains;
+    let hand_before = game.players[pi].zones.hand.len();
+    let max_hand = 6usize.saturating_sub(chain_penalty(chains));
+    while game.players[pi].zones.hand.len() < max_hand {
         if game.players[pi].zones.draw().is_none() {
             break;
         }
     }
+    // Shed 1 chain if chains were active and the player had room to draw.
+    if chains > 0 && hand_before < 6 {
+        game.players[pi].player.chains -= 1;
+    }
 
+    game.omega_triggered = false;
     game.active_player = 1 - pi;
     game.active_house = None;
     game.turn += 1;
     game.cards_used_this_turn = 0;
+    game.card_use_counts.clear();
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Cards drawn fewer per hand refill based on chain count.
+fn chain_penalty(chains: u32) -> usize {
+    match chains {
+        0 => 0,
+        1..=6 => 1,
+        7..=12 => 2,
+        13..=18 => 3,
+        _ => 4,
+    }
+}
+
+/// Resolve all bonus icons on a card immediately after it is played.
+/// Non-interactive icons (Aember, Draw) resolve automatically.
+/// Capture defaults to the played creature if it's a creature, else the first friendly creature.
+/// Damage defaults to the first enemy creature (first friendly if no enemies).
+/// Discard requires player choice and is skipped in this POC.
+fn resolve_bonus_icons(game: &mut GameState, card_id: CardId, pi: usize) {
+    let icons: &'static [BonusIcon] = game.cards[&card_id].def.bonus_icons;
+    let opp = 1 - pi;
+    for &icon in icons {
+        match icon {
+            BonusIcon::Aember => {
+                game.players[pi].player.aember_pool += 1;
+            }
+            BonusIcon::Capture => {
+                let n = 1_u32.min(game.players[opp].player.aember_pool);
+                game.players[opp].player.aember_pool -= n;
+                let is_creature = game.cards[&card_id].def.card_type == CardType::Creature;
+                let target = if is_creature {
+                    Some(card_id)
+                } else {
+                    game.players[pi].zones.battleline.creature_ids().into_iter().next()
+                };
+                match target {
+                    Some(t) => { game.cards.get_mut(&t).unwrap().aember += n; }
+                    None => { game.players[opp].player.aember_pool += n; } // no target: refund
+                }
+            }
+            BonusIcon::Damage => {
+                let target = {
+                    let enemies = game.players[opp].zones.battleline.creature_ids();
+                    if let Some(&t) = enemies.first() {
+                        Some(t)
+                    } else {
+                        game.players[pi].zones.battleline.creature_ids().into_iter().next()
+                    }
+                };
+                if let Some(t) = target {
+                    game.cards.get_mut(&t).unwrap().deal_damage(1);
+                    destroy_dead(game);
+                }
+            }
+            BonusIcon::Draw => {
+                game.players[pi].zones.draw();
+            }
+            BonusIcon::Discard => {
+                // Requires player choice — not resolvable without UI targeting in this POC.
+            }
+        }
+    }
+}
 
 /// Extract the X value from Assault(X), Hazardous(X), or SplashAttack(X).
 /// Pass Keyword::Assault(0) / Keyword::Hazardous(0) / Keyword::SplashAttack(0) as tag.
@@ -430,7 +621,12 @@ fn destroy_dead(game: &mut GameState) {
             .battleline
             .creature_ids()
             .into_iter()
-            .filter(|id| game.cards.get(id).map(|c| c.is_destroyed()).unwrap_or(false))
+            .filter(|id| {
+                game.cards
+                    .get(id)
+                    .map(|c| c.is_destroyed() && !c.has_keyword(Keyword::Invulnerable))
+                    .unwrap_or(false)
+            })
             .collect();
 
         for id in dead {
@@ -757,10 +953,10 @@ mod tests {
     fn test_reap_exhausts_and_gains_aember() {
         let mut game = two_player_game(&[&TROLL], &[&TROLL]);
         let id = game.players[0].zones.draw().unwrap();
-        play_card(&mut game, id, Flank::Left);
-        reap(&mut game, id);
+        play_card(&mut game, id, Flank::Left); // bonus icon: +1 aember
+        reap(&mut game, id);                   // base reap: +1 aember
         assert!(game.cards[&id].exhausted);
-        assert_eq!(game.players[0].player.aember_pool, 1);
+        assert_eq!(game.players[0].player.aember_pool, 2); // 1 bonus icon + 1 reap
     }
 
     // ---- Alpha keyword ----
@@ -1121,6 +1317,328 @@ mod tests {
         assert_eq!(game.active_player, 1);
         assert_eq!(game.turn, 2);
         assert_eq!(game.cards_used_this_turn, 0); // reset on end turn
+    }
+
+    // ---- Stun ----
+
+    #[test]
+    fn test_stun_blocks_reap() {
+        let mut game = two_player_game(&[&TROLL], &[&TROLL]);
+        let id = game.players[0].zones.draw().unwrap();
+        play_card(&mut game, id, Flank::Left);
+        game.cards.get_mut(&id).unwrap().stun = true;
+        assert!(!can_reap(&game, id));
+    }
+
+    #[test]
+    fn test_stun_blocks_fight() {
+        let mut game = two_player_game(&[&TROLL], &[&TROLL]);
+        let id = game.players[0].zones.draw().unwrap();
+        play_card(&mut game, id, Flank::Left);
+        game.cards.get_mut(&id).unwrap().stun = true;
+        assert!(!can_fight_with(&game, id));
+    }
+
+    #[test]
+    fn test_unstun_exhausts_and_clears_stun() {
+        let mut game = two_player_game(&[&TROLL], &[&TROLL]);
+        let id = game.players[0].zones.draw().unwrap();
+        play_card(&mut game, id, Flank::Left);
+        game.cards.get_mut(&id).unwrap().stun = true;
+        unstun(&mut game, id);
+        assert!(!game.cards[&id].stun);
+        assert!(game.cards[&id].exhausted);
+    }
+
+    // ---- Enrage ----
+
+    #[test]
+    fn test_enraged_cannot_reap_when_enemies_exist() {
+        let mut game = two_player_game(&[&TROLL], &[&TROLL]);
+        let att = game.players[0].zones.draw().unwrap();
+        let def = game.players[1].zones.draw().unwrap();
+        play_card(&mut game, att, Flank::Left);
+        game.active_player = 1;
+        play_card(&mut game, def, Flank::Left);
+        game.active_player = 0;
+        game.cards.get_mut(&att).unwrap().enrage = true;
+        assert!(!can_reap(&game, att));
+    }
+
+    #[test]
+    fn test_enraged_can_reap_when_no_enemies() {
+        let mut game = two_player_game(&[&TROLL], &[&TROLL]);
+        let att = game.players[0].zones.draw().unwrap();
+        play_card(&mut game, att, Flank::Left);
+        game.cards.get_mut(&att).unwrap().enrage = true;
+        assert!(can_reap(&game, att)); // no enemies
+    }
+
+    // ---- Invulnerable ----
+
+    static INVULNERABLE_CREATURE: CardDef = CardDef {
+        name: "Immortal",
+        card_type: CardType::Creature,
+        house: House::Sanctum,
+        power: Some(3),
+        armor: None,
+        keywords: &[Keyword::Invulnerable],
+        bonus_icons: &[],
+        traits: &[],
+        rarity: Rarity::Rare,
+        on_reap: &[],
+        on_fight: &[],
+        on_play: &[],
+        on_destroyed: &[],
+    };
+
+    #[test]
+    fn test_invulnerable_ignores_damage() {
+        let mut game = two_player_game(&[&TROLL], &[&INVULNERABLE_CREATURE]);
+        let att = game.players[0].zones.draw().unwrap();
+        let def = game.players[1].zones.draw().unwrap();
+        play_card(&mut game, att, Flank::Left);
+        game.active_player = 1;
+        play_card(&mut game, def, Flank::Left);
+        game.active_player = 0;
+        attack(&mut game, att, def);
+        assert_eq!(game.cards[&def].damage, 0); // no damage taken
+        assert!(!game.players[1].zones.battleline.is_empty()); // survives
+    }
+
+    // ---- Omega ----
+
+    static OMEGA_CREATURE: CardDef = CardDef {
+        name: "Omega Beast",
+        card_type: CardType::Creature,
+        house: House::Brobnar,
+        power: Some(3),
+        armor: None,
+        keywords: &[Keyword::Omega],
+        bonus_icons: &[],
+        traits: &[],
+        rarity: Rarity::Rare,
+        on_reap: &[],
+        on_fight: &[],
+        on_play: &[],
+        on_destroyed: &[],
+    };
+
+    #[test]
+    fn test_omega_blocks_further_plays() {
+        // Last element = top of deck; OMEGA_CREATURE is drawn first.
+        let mut game = two_player_game(&[&TROLL, &OMEGA_CREATURE], &[&TROLL]);
+        let omega_id = game.players[0].zones.draw().unwrap();
+        play_card(&mut game, omega_id, Flank::Left);
+        assert!(game.omega_triggered);
+        let troll_id = game.players[0].zones.draw().unwrap();
+        assert!(!can_play(&game, troll_id));
+    }
+
+    #[test]
+    fn test_omega_resets_on_end_turn() {
+        let mut game = two_player_game(&[&OMEGA_CREATURE], &[&TROLL]);
+        let id = game.players[0].zones.draw().unwrap();
+        play_card(&mut game, id, Flank::Left);
+        assert!(game.omega_triggered);
+        end_turn(&mut game);
+        assert!(!game.omega_triggered);
+    }
+
+    // ---- Versatile ----
+
+    static VERSATILE_CREATURE: CardDef = CardDef {
+        name: "Chameleon",
+        card_type: CardType::Creature,
+        house: House::Logos,
+        power: Some(2),
+        armor: None,
+        keywords: &[Keyword::Versatile],
+        bonus_icons: &[],
+        traits: &[],
+        rarity: Rarity::Common,
+        on_reap: &[],
+        on_fight: &[],
+        on_play: &[],
+        on_destroyed: &[],
+    };
+
+    #[test]
+    fn test_versatile_is_active_house_regardless() {
+        let mut game = two_player_game(&[&VERSATILE_CREATURE], &[&TROLL]);
+        let id = game.players[0].zones.draw().unwrap();
+        game.active_house = Some(House::Brobnar); // Versatile is Logos
+        assert!(is_active_house_card(&game, id));
+    }
+
+    #[test]
+    fn test_non_versatile_wrong_house_is_not_active() {
+        let mut game = two_player_game(&[&TROLL], &[&TROLL]);
+        let id = game.players[0].zones.draw().unwrap();
+        game.active_house = Some(House::Dis); // Troll is Brobnar
+        assert!(!is_active_house_card(&game, id));
+    }
+
+    // ---- Treachery ----
+
+    static TREACHERY_CREATURE: CardDef = CardDef {
+        name: "Turncoat",
+        card_type: CardType::Creature,
+        house: House::Dis,
+        power: Some(2),
+        armor: None,
+        keywords: &[Keyword::Treachery],
+        bonus_icons: &[],
+        traits: &[],
+        rarity: Rarity::Rare,
+        on_reap: &[],
+        on_fight: &[],
+        on_play: &[],
+        on_destroyed: &[],
+    };
+
+    #[test]
+    fn test_treachery_enters_opponent_battleline() {
+        let mut game = two_player_game(&[&TREACHERY_CREATURE], &[&TROLL]);
+        let id = game.players[0].zones.draw().unwrap();
+        play_card(&mut game, id, Flank::Left);
+        assert!(game.players[0].zones.battleline.is_empty()); // not on player's line
+        assert!(game.players[1].zones.battleline.creature_ids().contains(&id));
+    }
+
+    // ---- Chains ----
+
+    #[test]
+    fn test_chains_reduce_draw() {
+        // Give player 0 exactly 6 chains (penalty = 1 fewer card → refill to 5).
+        let mut game = two_player_game(
+            &[&TROLL, &TROLL, &TROLL, &TROLL, &TROLL, &TROLL, &TROLL],
+            &[&TROLL],
+        );
+        game.players[0].player.chains = 6;
+        game.players[0].zones.hand.clear(); // ensure a clean refill
+        // active_player = 0 by default
+        end_turn(&mut game);
+        // Chains = 6 → penalty 1 → max hand 5
+        assert_eq!(game.players[0].zones.hand.len(), 5);
+        // Chains shed 1
+        assert_eq!(game.players[0].player.chains, 5);
+    }
+
+    // ---- First Turn Rule ----
+
+    #[test]
+    fn test_first_turn_rule_blocks_second_play() {
+        let mut game = two_player_game(&[&TROLL, &TROLL], &[&TROLL]);
+        let id1 = game.players[0].zones.draw().unwrap();
+        let id2 = game.players[0].zones.draw().unwrap();
+        play_card(&mut game, id1, Flank::Left); // first action — allowed
+        assert!(!can_play(&game, id2));          // second action on turn 1 — blocked
+    }
+
+    #[test]
+    fn test_first_turn_rule_only_applies_turn_one() {
+        // 8 cards so P0 still has deck remaining after drawing to 6 on turn 1.
+        let mut game = two_player_game(
+            &[&TROLL, &TROLL, &TROLL, &TROLL, &TROLL, &TROLL, &TROLL, &TROLL],
+            &[&TROLL],
+        );
+        end_turn(&mut game); // P0 draws 6; turn 2, P1
+        end_turn(&mut game); // P1 draws; turn 3, P0
+        // P0 has 6 cards in hand from turn 1 refill.
+        let id1 = game.players[0].zones.hand[0];
+        let id2 = game.players[0].zones.hand[1];
+        play_card(&mut game, id1, Flank::Left);
+        assert!(can_play(&game, id2)); // turn 3 — no restriction
+    }
+
+    // ---- Bonus Icons ----
+
+    #[test]
+    fn test_bonus_icon_aember_on_play() {
+        let mut game = two_player_game(&[&TROLL], &[&TROLL]);
+        let id = game.players[0].zones.draw().unwrap();
+        play_card(&mut game, id, Flank::Left); // TROLL has BonusIcon::Aember
+        assert_eq!(game.players[0].player.aember_pool, 1);
+    }
+
+    #[test]
+    fn test_bonus_icon_damage_hits_first_enemy() {
+        // VEZYMA has no armor so the 1 bonus damage lands.
+        let mut game = two_player_game(&[&SMAAASH], &[&VEZYMA_THINKDRONE]);
+        let att = game.players[0].zones.draw().unwrap();
+        let def = game.players[1].zones.draw().unwrap();
+        // Play defender first so it is the target when attacker's bonus damage resolves.
+        game.active_player = 1;
+        play_card(&mut game, def, Flank::Left);
+        game.active_player = 0;
+        play_card(&mut game, att, Flank::Left); // SMAAASH has BonusIcon::Damage
+        // Defender (Vezyma: 1 power, no armor) takes 1 damage and is destroyed.
+        assert!(game.players[1].zones.discard.contains(&def));
+    }
+
+    // ---- Rule of Six ----
+
+    #[test]
+    fn test_rule_of_six_blocks_seventh_use() {
+        let mut game = two_player_game(&[&TROLL], &[&TROLL]);
+        let id = game.players[0].zones.draw().unwrap();
+        play_card(&mut game, id, Flank::Left); // play counts as 1 use
+        // Simulate 5 reaps to reach the limit.
+        game.cards.get_mut(&id).unwrap().exhausted = false;
+        for _ in 0..5 {
+            *game.card_use_counts.entry("Troll").or_insert(0) += 1;
+        }
+        // Now at 6 uses total (1 play + 5 simulated). Further reap/play blocked.
+        assert!(!can_reap(&game, id));
+    }
+
+    // ---- Discard from hand ----
+
+    #[test]
+    fn test_discard_card_from_hand() {
+        let mut game = two_player_game(&[&TROLL], &[&TROLL]);
+        let id = game.players[0].zones.draw().unwrap();
+        assert!(game.players[0].zones.hand.contains(&id));
+        discard_card_from_hand(&mut game, id);
+        assert!(!game.players[0].zones.hand.contains(&id));
+        assert!(game.players[0].zones.discard.contains(&id));
+        assert_eq!(game.cards_used_this_turn, 1);
+    }
+
+    // ---- After Fight: attacker survival ----
+
+    static WEAK_FIGHT_EFFECT: CardDef = CardDef {
+        name: "Weak Berserker",
+        card_type: CardType::Creature,
+        house: House::Brobnar,
+        power: Some(1),
+        armor: None,
+        keywords: &[],
+        bonus_icons: &[],
+        traits: &[],
+        rarity: Rarity::Common,
+        on_reap: &[],
+        on_fight: &[Effect::GainAember(5)],
+        on_play: &[],
+        on_destroyed: &[],
+    };
+
+    #[test]
+    fn test_after_fight_does_not_fire_when_attacker_dies() {
+        // Attacker (1 power) fights Troll (5 power) → attacker is destroyed.
+        // on_fight GainAember(5) should NOT fire since attacker died.
+        let mut game = two_player_game(&[&WEAK_FIGHT_EFFECT], &[&TROLL]);
+        let att = game.players[0].zones.draw().unwrap();
+        let def = game.players[1].zones.draw().unwrap();
+        play_card(&mut game, att, Flank::Left);
+        game.active_player = 1;
+        play_card(&mut game, def, Flank::Left);
+        game.active_player = 0;
+        let aember_before = game.players[0].player.aember_pool;
+        attack(&mut game, att, def);
+        // Attacker destroyed → on_fight should not have fired
+        assert_eq!(game.players[0].player.aember_pool, aember_before);
     }
 
     #[test]

@@ -53,11 +53,15 @@ pub enum Keyword {
     Elusive,
     Exalt,
     Hazardous(u32),
+    Invulnerable,
+    Omega,
     Poison,
     Skirmish,
     SplashAttack(u32),
     Steal,
     Taunt,
+    Treachery,
+    Versatile,
 }
 
 /// Triggered ability effects applied when the associated trigger fires.
@@ -159,8 +163,11 @@ impl Card {
         self.power() > 0 && self.damage >= self.power()
     }
 
-    /// Apply pending damage after ward and armor reduction.
+    /// Apply pending damage after invulnerability, ward, and armor reduction.
     pub fn deal_damage(&mut self, amount: u32) {
+        if self.has_keyword(Keyword::Invulnerable) {
+            return;
+        }
         if self.ward {
             self.ward = false;
             return;
