@@ -115,9 +115,8 @@ impl App {
         let (mut all, ids0) = deck::build_deck(p0);
         let (cards1, ids1) = deck::build_deck(p1);
         all.extend(cards1);
-        let mut g = GameState::new(ids0, ids1, all);
-        for _ in 0..6 { g.players[0].zones.draw(); }
-        for _ in 0..6 { g.players[1].zones.draw(); }
+        // GameState::new handles setup draw (7 for first player, 6 for second).
+        let g = GameState::new(ids0, ids1, all);
         Self {
             game: g,
             selected_hand: None,

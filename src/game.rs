@@ -72,6 +72,37 @@ impl GameState {
         p1_deck: Vec<CardId>,
         cards: HashMap<CardId, Card>,
     ) -> Self {
+        let mut state = Self {
+            players: [
+                PlayerState { player: Player::new(), zones: PlayerZones::new(p0_deck) },
+                PlayerState { player: Player::new(), zones: PlayerZones::new(p1_deck) },
+            ],
+            cards,
+            active_player: 0,
+            active_house: None,
+            turn: 1,
+            first_player: 0,
+            cards_used_this_turn: 0,
+            card_use_counts: HashMap::new(),
+            omega_triggered: false,
+        };
+        // Setup draw: first player draws 7, second player draws 6.
+        for _ in 0..7 {
+            state.players[0].zones.draw();
+        }
+        for _ in 0..6 {
+            state.players[1].zones.draw();
+        }
+        state
+    }
+
+    /// Create a game state without the initial draw (for tests that manage hands manually).
+    #[cfg(test)]
+    pub fn new_no_draw(
+        p0_deck: Vec<CardId>,
+        p1_deck: Vec<CardId>,
+        cards: HashMap<CardId, Card>,
+    ) -> Self {
         Self {
             players: [
                 PlayerState { player: Player::new(), zones: PlayerZones::new(p0_deck) },
@@ -659,7 +690,8 @@ mod tests {
         let (mut cards, ids0) = build_deck(p0);
         let (cards1, ids1) = build_deck(p1);
         cards.extend(cards1);
-        GameState::new(ids0, ids1, cards)
+        // Tests manage hands manually, so skip the setup draw.
+        GameState::new_no_draw(ids0, ids1, cards)
     }
 
     // ---- helpers: card defs for tests that need specific keywords ----
@@ -824,6 +856,19 @@ mod tests {
         on_play: &[],
         on_destroyed: &[],
     };
+
+    // ---- setup draw ----
+
+    #[test]
+    fn test_setup_draw_seven_and_six() {
+        let defs: Vec<&'static CardDef> = vec![&TROLL; 12];
+        let (mut cards, ids0) = build_deck(&defs);
+        let (cards1, ids1) = build_deck(&defs);
+        cards.extend(cards1);
+        let game = GameState::new(ids0, ids1, cards);
+        assert_eq!(game.players[0].zones.hand.len(), 7); // first player draws 7
+        assert_eq!(game.players[1].zones.hand.len(), 6); // second player draws 6
+    }
 
     // ---- key / forge tests ----
 
