@@ -409,4 +409,60 @@ mod tests {
         assert!(b.is_on_flank(3));
         assert!(!b.is_on_flank(2));
     }
+
+    #[test]
+    fn test_shuffle_into_deck() {
+        let mut z = zones_with_deck(vec![]);
+        z.hand.push(42);
+        z.play_creature(42, Flank::Left);
+        z.shuffle_into_deck(42);
+        assert_eq!(z.battleline.len(), 0);
+        assert!(z.deck.contains(&42));
+    }
+
+    #[test]
+    fn test_purge_from_hand() {
+        let mut z = zones_with_deck(vec![]);
+        z.hand.push(1);
+        z.purge(1);
+        assert!(!z.hand.contains(&1));
+        assert!(z.purged.contains(&1));
+    }
+
+    #[test]
+    fn test_purge_from_deck() {
+        let mut z = zones_with_deck(vec![5]);
+        z.purge(5);
+        assert!(!z.deck.contains(&5));
+        assert!(z.purged.contains(&5));
+    }
+
+    #[test]
+    fn test_purge_from_battleline() {
+        let mut z = zones_with_deck(vec![]);
+        z.hand.push(7);
+        z.play_creature(7, Flank::Left);
+        z.purge(7);
+        assert_eq!(z.battleline.len(), 0);
+        assert!(z.purged.contains(&7));
+    }
+
+    #[test]
+    fn test_purge_from_artifacts() {
+        let mut z = zones_with_deck(vec![]);
+        z.hand.push(9);
+        z.play_artifact(9);
+        z.purge(9);
+        assert!(!z.artifacts.contains(&9));
+        assert!(z.purged.contains(&9));
+    }
+
+    #[test]
+    fn test_purge_from_archives() {
+        let mut z = zones_with_deck(vec![]);
+        z.archives.push(11);
+        z.purge(11);
+        assert!(!z.archives.contains(&11));
+        assert!(z.purged.contains(&11));
+    }
 }

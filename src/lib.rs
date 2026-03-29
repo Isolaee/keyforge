@@ -3,6 +3,7 @@ pub mod cards;
 pub mod deck;
 pub mod game;
 pub mod protocol;
+pub mod server;
 pub mod victory;
 pub mod view;
 pub mod zones;

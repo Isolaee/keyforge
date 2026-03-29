@@ -113,3 +113,200 @@ pub struct ClientGameView {
     pub opp_archives_count: usize,
     pub opp_deck_count: usize,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::card::{BonusIcon, CardType, Effect, House, Keyword, Rarity};
+    use crate::victory::KeyColor;
+    use crate::zones::Flank;
+
+    fn roundtrip_client<T: serde::Serialize + for<'de> serde::Deserialize<'de> + std::fmt::Debug>(msg: T) {
+        let json = serde_json::to_string(&msg).expect("serialize");
+        let decoded: T = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(format!("{:?}", msg), format!("{:?}", decoded));
+    }
+
+    fn roundtrip_server(msg: &ServerMessage) -> ServerMessage {
+        let json = serde_json::to_string(msg).expect("serialize");
+        serde_json::from_str(&json).expect("deserialize")
+    }
+
+    // ---- ClientMessage variants ----
+
+    #[test]
+    fn test_serialize_choose_house() {
+        roundtrip_client(ClientMessage::ChooseHouse {
+            house: House::Brobnar,
+            pick_up_archives: true,
+        });
+    }
+
+    #[test]
+    fn test_serialize_play_card() {
+        roundtrip_client(ClientMessage::PlayCard { card_id: 42, flank: Flank::Right });
+    }
+
+    #[test]
+    fn test_serialize_play_card_deployed() {
+        roundtrip_client(ClientMessage::PlayCardDeployed { card_id: 7, index: 2 });
+    }
+
+    #[test]
+    fn test_serialize_reap() {
+        roundtrip_client(ClientMessage::Reap { card_id: 5 });
+    }
+
+    #[test]
+    fn test_serialize_attack() {
+        roundtrip_client(ClientMessage::Attack { attacker_id: 1, defender_id: 2 });
+    }
+
+    #[test]
+    fn test_serialize_unstun() {
+        roundtrip_client(ClientMessage::Unstun { card_id: 3 });
+    }
+
+    #[test]
+    fn test_serialize_discard_from_hand() {
+        roundtrip_client(ClientMessage::DiscardFromHand { card_id: 10 });
+    }
+
+    #[test]
+    fn test_serialize_end_turn() {
+        roundtrip_client(ClientMessage::EndTurn);
+    }
+
+    // ---- ServerMessage variants ----
+
+    #[test]
+    fn test_serialize_welcome() {
+        let msg = ServerMessage::Welcome { player_index: 1 };
+        let rt = roundtrip_server(&msg);
+        assert!(matches!(rt, ServerMessage::Welcome { player_index: 1 }));
+    }
+
+    #[test]
+    fn test_serialize_error() {
+        let msg = ServerMessage::Error("Card not in hand".into());
+        let rt = roundtrip_server(&msg);
+        assert!(matches!(rt, ServerMessage::Error(ref s) if s == "Card not in hand"));
+    }
+
+    #[test]
+    fn test_serialize_game_over() {
+        let msg = ServerMessage::GameOver { winner: 0 };
+        let rt = roundtrip_server(&msg);
+        assert!(matches!(rt, ServerMessage::GameOver { winner: 0 }));
+    }
+
+    #[test]
+    fn test_serialize_game_state() {
+        let view = ClientGameView {
+            my_index: 0,
+            active_player: 0,
+            active_house: Some(House::Logos),
+            turn: 3,
+            my_player: PlayerView {
+                aember_pool: 4,
+                keys: vec![
+                    KeyView { color: KeyColor::Red, forged: true },
+                    KeyView { color: KeyColor::Blue, forged: false },
+                    KeyView { color: KeyColor::Yellow, forged: false },
+                ],
+                chains: 0,
+            },
+            my_hand: vec![CardView {
+                id: 1,
+                name: "Troll".into(),
+                card_type: CardType::Creature,
+                house: House::Brobnar,
+                power: Some(5),
+                armor: Some(1),
+                keywords: vec![Keyword::Taunt],
+                bonus_icons: vec![BonusIcon::Aember],
+                traits: vec!["Giant".into()],
+                rarity: Rarity::Common,
+                on_reap: vec![],
+                on_fight: vec![],
+                on_play: vec![],
+                on_destroyed: vec![],
+                exhausted: false,
+                damage: 0,
+                aember: 0,
+                stun: false,
+                ward: false,
+                enrage: false,
+                power_counters: 0,
+                armor_bonus: 0,
+            }],
+            my_battleline: vec![],
+            my_artifacts: vec![],
+            my_discard: vec![],
+            my_archives: vec![],
+            my_deck_count: 5,
+            opp_player: PlayerView {
+                aember_pool: 2,
+                keys: vec![
+                    KeyView { color: KeyColor::Red, forged: false },
+                    KeyView { color: KeyColor::Blue, forged: false },
+                    KeyView { color: KeyColor::Yellow, forged: false },
+                ],
+                chains: 6,
+            },
+            opp_hand_count: 4,
+            opp_battleline: vec![],
+            opp_artifacts: vec![],
+            opp_discard: vec![],
+            opp_archives_count: 1,
+            opp_deck_count: 3,
+        };
+        let msg = ServerMessage::GameState(view.clone());
+        let rt = roundtrip_server(&msg);
+        if let ServerMessage::GameState(rt_view) = rt {
+            assert_eq!(rt_view.my_index, 0);
+            assert_eq!(rt_view.turn, 3);
+            assert_eq!(rt_view.active_house, Some(House::Logos));
+            assert_eq!(rt_view.my_player.aember_pool, 4);
+            assert_eq!(rt_view.my_hand.len(), 1);
+            assert_eq!(rt_view.my_hand[0].name, "Troll");
+            assert_eq!(rt_view.my_player.keys[0].color, KeyColor::Red);
+            assert!(rt_view.my_player.keys[0].forged);
+            assert_eq!(rt_view.opp_player.chains, 6);
+            assert_eq!(rt_view.my_deck_count, 5);
+            assert_eq!(rt_view.opp_hand_count, 4);
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    // ---- Wire format spot-checks ----
+
+    #[test]
+    fn test_end_turn_wire_format() {
+        let json = serde_json::to_string(&ClientMessage::EndTurn).unwrap();
+        assert_eq!(json, r#""EndTurn""#);
+    }
+
+    #[test]
+    fn test_welcome_wire_format() {
+        let json = serde_json::to_string(&ServerMessage::Welcome { player_index: 0 }).unwrap();
+        assert!(json.contains("Welcome"));
+        assert!(json.contains("player_index"));
+        assert!(json.contains('0'));
+    }
+
+    #[test]
+    fn test_error_wire_format() {
+        let json = serde_json::to_string(&ServerMessage::Error("oops".into())).unwrap();
+        assert_eq!(json, r#"{"Error":"oops"}"#);
+    }
+
+    #[test]
+    fn test_client_message_unknown_field_rejected() {
+        // Malformed JSON should not deserialize as a valid message.
+        let bad = r#"{"NotAMessage":{}}"#;
+        let result: Result<ClientMessage, _> = serde_json::from_str(bad);
+        assert!(result.is_err());
+    }
+}

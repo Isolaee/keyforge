@@ -4,10 +4,8 @@ use std::net::{TcpListener, TcpStream};
 use keyforge::card::CardDef;
 use keyforge::cards;
 use keyforge::deck;
-use keyforge::game::{
-    attack, choose_house, end_turn, play_card, play_card_deployed, reap, step_forge_key, unstun,
-    GameState,
-};
+use keyforge::game::GameState;
+use keyforge::server::dispatch_message;
 use keyforge::protocol::{ClientMessage, ServerMessage};
 use keyforge::view::to_client_view;
 
@@ -107,72 +105,7 @@ fn main() {
 
         println!("P{}: {:?}", ap, msg);
 
-        let result: Result<(), String> = match msg {
-            ClientMessage::ChooseHouse { house, pick_up_archives } => {
-                choose_house(&mut game, house, pick_up_archives);
-                Ok(())
-            }
-            ClientMessage::PlayCard { card_id, flank } => {
-                if !game.players[ap].zones.hand.contains(&card_id) {
-                    Err("Card not in hand".into())
-                } else {
-                    play_card(&mut game, card_id, flank);
-                    Ok(())
-                }
-            }
-            ClientMessage::PlayCardDeployed { card_id, index } => {
-                if !game.players[ap].zones.hand.contains(&card_id) {
-                    Err("Card not in hand".into())
-                } else {
-                    play_card_deployed(&mut game, card_id, index);
-                    Ok(())
-                }
-            }
-            ClientMessage::Reap { card_id } => {
-                let on_line = game.players[ap].zones.battleline.creature_ids().contains(&card_id);
-                if !on_line {
-                    Err("Creature not on your battleline".into())
-                } else {
-                    reap(&mut game, card_id);
-                    Ok(())
-                }
-            }
-            ClientMessage::Attack { attacker_id, defender_id } => {
-                let own = game.players[ap].zones.battleline.creature_ids();
-                let opp = game.players[1 - ap].zones.battleline.creature_ids();
-                if !own.contains(&attacker_id) {
-                    Err("Attacker not on your battleline".into())
-                } else if !opp.contains(&defender_id) {
-                    Err("Defender not on opponent battleline".into())
-                } else {
-                    attack(&mut game, attacker_id, defender_id);
-                    Ok(())
-                }
-            }
-            ClientMessage::Unstun { card_id } => {
-                let on_line = game.players[ap].zones.battleline.creature_ids().contains(&card_id);
-                if !on_line {
-                    Err("Creature not on your battleline".into())
-                } else {
-                    unstun(&mut game, card_id);
-                    Ok(())
-                }
-            }
-            ClientMessage::DiscardFromHand { card_id } => {
-                if !game.players[ap].zones.hand.contains(&card_id) {
-                    Err("Card not in hand".into())
-                } else {
-                    game.players[ap].zones.discard_from_hand(card_id);
-                    Ok(())
-                }
-            }
-            ClientMessage::EndTurn => {
-                end_turn(&mut game);
-                let new_ap = game.active_player;
-                step_forge_key(&mut game.players[new_ap].player);
-                Ok(())
-            }
-        };
+        let result = dispatch_message(&mut game, ap, msg);
 
         if let Err(e) = result {
             send(&mut streams[ap], &ServerMessage::Error(e));
