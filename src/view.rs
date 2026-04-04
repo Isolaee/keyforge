@@ -18,6 +18,7 @@ fn card_view(card: &Card) -> CardView {
         on_fight: card.def.on_fight.to_vec(),
         on_play: card.def.on_play.to_vec(),
         on_destroyed: card.def.on_destroyed.to_vec(),
+        text: card.def.text.to_string(),
         exhausted: card.exhausted,
         damage: card.damage,
         aember: card.aember,
@@ -97,6 +98,7 @@ mod tests {
         on_fight: &[],
         on_play: &[],
         on_destroyed: &[],
+        text: "Reap: Gain 1 aember.",
     };
 
     static DEF_B: CardDef = CardDef {
@@ -113,6 +115,7 @@ mod tests {
         on_fight: &[],
         on_play: &[],
         on_destroyed: &[],
+        text: "Poison. Fight: Steal 1 aember.",
     };
 
     fn test_game() -> GameState {

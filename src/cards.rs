@@ -16,6 +16,7 @@ pub static TROLL: CardDef = CardDef {
     on_fight: &[],
     on_play: &[],
     on_destroyed: &[],
+    text: "Taunt.",
 };
 
 pub static BANNER_OF_BATTLE: CardDef = CardDef {
@@ -32,6 +33,7 @@ pub static BANNER_OF_BATTLE: CardDef = CardDef {
     on_fight: &[],
     on_play: &[],
     on_destroyed: &[],
+    text: "Each friendly Brobnar creature gains +1 power.",
 };
 
 pub static SMAAASH: CardDef = CardDef {
@@ -48,6 +50,7 @@ pub static SMAAASH: CardDef = CardDef {
     on_fight: &[],
     on_play: &[],
     on_destroyed: &[],
+    text: "Assault 2.",
 };
 
 // --- Dis ---
@@ -66,6 +69,7 @@ pub static VEZYMA_THINKDRONE: CardDef = CardDef {
     on_fight: &[],
     on_play: &[],
     on_destroyed: &[],
+    text: "Poison. Reap: Draw 1 card.",
 };
 
 pub static PLAGUE: CardDef = CardDef {
@@ -82,6 +86,7 @@ pub static PLAGUE: CardDef = CardDef {
     on_fight: &[],
     on_play: &[Effect::DealDamageToEachEnemy(1)],
     on_destroyed: &[],
+    text: "Play: Deal 1 damage to each enemy creature.",
 };
 
 // --- Shadows ---
@@ -100,6 +105,7 @@ pub static SILVERTOOTH: CardDef = CardDef {
     on_fight: &[],
     on_play: &[],
     on_destroyed: &[],
+    text: "Skirmish. Steal.",
 };
 
 pub static SHADOW_SELF: CardDef = CardDef {
@@ -116,4 +122,5 @@ pub static SHADOW_SELF: CardDef = CardDef {
     on_fight: &[],
     on_play: &[],
     on_destroyed: &[],
+    text: "Elusive. The upgraded creature gains Elusive.",
 };

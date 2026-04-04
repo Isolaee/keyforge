@@ -103,6 +103,8 @@ pub struct CardDef {
     pub on_play: &'static [Effect],
     /// Effects that fire when this card is destroyed.
     pub on_destroyed: &'static [Effect],
+    /// Human-readable card text (rules text printed on the card).
+    pub text: &'static str,
 }
 
 /// A specific card in a game, with mutable state.
@@ -224,6 +226,7 @@ mod tests {
         on_fight: &[],
         on_play: &[],
         on_destroyed: &[],
+        text: "Reap: Gain 1 aember.",
     };
 
     static NO_ARMOR_DEF: CardDef = CardDef {
@@ -240,6 +243,7 @@ mod tests {
         on_fight: &[],
         on_play: &[],
         on_destroyed: &[],
+        text: "Fight: Deal 1 damage to a friendly creature.",
     };
 
     static KEYWORD_DEF: CardDef = CardDef {
@@ -256,6 +260,7 @@ mod tests {
         on_fight: &[],
         on_play: &[],
         on_destroyed: &[],
+        text: "Assault 3. Skirmish.",
     };
 
     #[test]

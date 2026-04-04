@@ -59,6 +59,8 @@ pub struct CardView {
     pub on_fight: Vec<Effect>,
     pub on_play: Vec<Effect>,
     pub on_destroyed: Vec<Effect>,
+    /// Human-readable card text.
+    pub text: String,
     // Mutable state
     pub exhausted: bool,
     pub damage: u32,
@@ -231,6 +233,7 @@ mod tests {
                 on_fight: vec![],
                 on_play: vec![],
                 on_destroyed: vec![],
+                text: "Taunt.".into(),
                 exhausted: false,
                 damage: 0,
                 aember: 0,

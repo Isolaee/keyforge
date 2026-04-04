@@ -1,4 +1,6 @@
 pub mod card;
+pub mod deck_store;
+pub mod vault;
 pub mod cards;
 pub mod deck;
 pub mod game;

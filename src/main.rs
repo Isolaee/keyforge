@@ -1,12 +1,15 @@
 use std::io::{BufRead, BufReader, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::mpsc;
+use std::time::Duration;
 
 use macroquad::prelude::*;
 
 use keyforge::card::{CardId, CardType, House};
+use keyforge::deck_store::SavedDeck;
 use keyforge::protocol::{CardView, ClientGameView, ClientMessage, ServerMessage};
 use keyforge::zones::Flank;
+use keyforge::{deck_store, vault};
 
 // ---------------------------------------------------------------------------
 // Dynamic layout — recomputed every frame from screen dimensions
@@ -102,8 +105,7 @@ struct App {
 }
 
 impl App {
-    fn connect(addr: &str) -> Self {
-        let stream = TcpStream::connect(addr).expect("connect");
+    fn from_stream(stream: TcpStream) -> Self {
         let reader_stream = stream.try_clone().expect("clone");
         let tx_stream = stream;
 
@@ -222,11 +224,41 @@ fn draw_artifact_row(l: &L, artifacts: &[CardView], is_mine: bool, y: f32) {
     }
 }
 
-fn draw_card(l: &L, x: f32, y: f32, name: &str, sub: &str, bg: Color, border: Color) {
+fn wrap_text(text: &str, font_size: f32, max_width: f32) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let candidate = if current.is_empty() {
+            word.to_string()
+        } else {
+            format!("{} {}", current, word)
+        };
+        if measure_text(&candidate, None, font_size as u16, 1.0).width > max_width && !current.is_empty() {
+            lines.push(current);
+            current = word.to_string();
+        } else {
+            current = candidate;
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn draw_card(l: &L, x: f32, y: f32, name: &str, text: &str, sub: &str, bg: Color, border: Color) {
     draw_rectangle(x, y, l.cw, l.ch, bg);
     draw_rectangle_lines(x, y, l.cw, l.ch, 2.0, border);
     let n = if name.len() > 11 { &name[..11] } else { name };
     draw_text(n, x + 4.0, y + l.ch * 0.17, l.ch * 0.11, WHITE);
+
+    let text_fs = l.ch * 0.09;
+    let line_h  = l.ch * 0.115;
+    let text_start_y = y + l.ch * 0.30;
+    for (i, line) in wrap_text(text, text_fs, l.cw - 8.0).iter().enumerate() {
+        draw_text(line, x + 4.0, text_start_y + i as f32 * line_h, text_fs, WHITE);
+    }
+
     draw_text(sub, x + 4.0, y + l.ch * 0.93, l.ch * 0.10, LIGHTGRAY);
 }
 
@@ -264,6 +296,217 @@ fn can_use_card(active_house: Option<House>, card: &CardView) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Screens
+// ---------------------------------------------------------------------------
+
+enum Screen {
+    Menu { status: String },
+    ImportDeck {
+        url: String,
+        status: String,
+        loading: Option<mpsc::Receiver<Result<SavedDeck, String>>>,
+    },
+    DecksList { decks: Vec<SavedDeck>, selected: Option<usize> },
+    InGame(App),
+}
+
+fn try_connect(addr: &str) -> Result<App, String> {
+    let sa = addr
+        .to_socket_addrs()
+        .map_err(|e| e.to_string())?
+        .next()
+        .ok_or_else(|| "Could not resolve address".to_string())?;
+    TcpStream::connect_timeout(&sa, Duration::from_secs(3))
+        .map(App::from_stream)
+        .map_err(|e| e.to_string())
+}
+
+fn draw_menu(status: &str, mx: f32, my: f32, click: bool) -> Option<&'static str> {
+    let sw = screen_width();
+    let sh = screen_height();
+    clear_background(Color::from_rgba(10, 30, 10, 255));
+
+    let title_fs = (sw * 0.06).clamp(32.0, 72.0);
+    let title_w  = measure_text("Keyforge", None, title_fs as u16, 1.0).width;
+    draw_text("Keyforge", (sw - title_w) / 2.0, sh * 0.25, title_fs, GOLD);
+
+    let bw = (sw * 0.22).clamp(160.0, 260.0);
+    let bh = (sh * 0.07).clamp(36.0, 52.0);
+    let bx = (sw - bw) / 2.0;
+    let fs = bh * 0.44;
+    let gap = bh * 0.35;
+
+    let buttons: &[(&str, &str, Color, Color)] = &[
+        ("Find Match",   "find",   Color::from_rgba(30, 100, 30,  255), Color::from_rgba(50, 160, 50,  255)),
+        ("Decks",        "decks",  Color::from_rgba(30,  60, 120, 255), Color::from_rgba(50, 100, 180, 255)),
+        ("Import Deck",  "import", Color::from_rgba(30,  60, 120, 255), Color::from_rgba(50, 100, 180, 255)),
+        ("Exit",         "exit",   Color::from_rgba(100, 30,  30, 255), Color::from_rgba(160, 50,  50, 255)),
+    ];
+
+    let total_h = buttons.len() as f32 * bh + (buttons.len() - 1) as f32 * gap;
+    let start_y = (sh - total_h) / 2.0 + sh * 0.05;
+
+    let mut action = None;
+    for (i, (label, id, bg_normal, bg_hover)) in buttons.iter().enumerate() {
+        let by  = start_y + i as f32 * (bh + gap);
+        let hov = in_box(mx, my, bx, by, bw, bh);
+        let bg  = if hov { *bg_hover } else { *bg_normal };
+        draw_rectangle(bx, by, bw, bh, bg);
+        draw_rectangle_lines(bx, by, bw, bh, 2.0, LIGHTGRAY);
+        let lw = measure_text(label, None, fs as u16, 1.0).width;
+        draw_text(label, bx + (bw - lw) / 2.0, by + bh * 0.68, fs, WHITE);
+        if click && hov { action = Some(*id); }
+    }
+
+    if !status.is_empty() {
+        let tw = measure_text(status, None, 14, 1.0).width;
+        draw_text(status, (sw - tw) / 2.0, start_y + total_h + 28.0, 14.0, YELLOW);
+    }
+
+    action
+}
+
+fn handle_text_input(text: &mut String) {
+    while let Some(c) = get_char_pressed() {
+        if !c.is_control() {
+            text.push(c);
+        }
+    }
+    if is_key_pressed(KeyCode::Backspace) && !text.is_empty() {
+        text.pop();
+    }
+    let ctrl = is_key_down(KeyCode::LeftControl) || is_key_down(KeyCode::RightControl);
+    if ctrl && is_key_pressed(KeyCode::V) {
+        if let Ok(mut cb) = arboard::Clipboard::new() {
+            if let Ok(s) = cb.get_text() {
+                text.push_str(&s);
+            }
+        }
+    }
+}
+
+fn draw_import_screen(url: &mut String, status: &str, loading: bool,
+                      mx: f32, my: f32, click: bool) -> Option<&'static str> {
+    let sw = screen_width();
+    let sh = screen_height();
+    clear_background(Color::from_rgba(10, 20, 30, 255));
+
+    let title_fs = (sw * 0.04).clamp(24.0, 48.0);
+    draw_text("Import Deck", 30.0, 50.0, title_fs, GOLD);
+    draw_text("Paste a KeyForge Vault URL:", 30.0, 90.0, 16.0, LIGHTGRAY);
+
+    // URL input box
+    let ix = 30.0;
+    let iy = 108.0;
+    let iw = sw - 60.0;
+    let ih = 36.0;
+    draw_rectangle(ix, iy, iw, ih, Color::from_rgba(20, 20, 40, 255));
+    draw_rectangle_lines(ix, iy, iw, ih, 2.0, LIGHTGRAY);
+
+    if !loading {
+        handle_text_input(url);
+    }
+
+    // Clip displayed text to box width
+    let url_fs = 15.0;
+    let display: String = {
+        let mut s = url.as_str();
+        while !s.is_empty() && measure_text(s, None, url_fs as u16, 1.0).width > iw - 12.0 {
+            s = &s[s.char_indices().nth(1).map(|(i, _)| i).unwrap_or(s.len())..];
+        }
+        s.to_string()
+    };
+    draw_text(&display, ix + 6.0, iy + ih * 0.68, url_fs, WHITE);
+
+    let mut action = None;
+    let bw = 120.0;
+    let bh = 36.0;
+    let by = iy + ih + 20.0;
+
+    // Import button
+    let imp_x = ix;
+    let imp_col = if loading { Color::from_rgba(40, 40, 40, 255) } else { Color::from_rgba(30, 100, 30, 255) };
+    let imp_hov = !loading && in_box(mx, my, imp_x, by, bw, bh);
+    let imp_bg  = if imp_hov { Color::from_rgba(50, 160, 50, 255) } else { imp_col };
+    draw_rectangle(imp_x, by, bw, bh, imp_bg);
+    draw_rectangle_lines(imp_x, by, bw, bh, 2.0, LIGHTGRAY);
+    draw_text("Import", imp_x + 28.0, by + bh * 0.68, 16.0, WHITE);
+    if click && imp_hov { action = Some("import"); }
+
+    // Back button
+    let back_x = imp_x + bw + 16.0;
+    let back_hov = in_box(mx, my, back_x, by, bw, bh);
+    let back_bg  = if back_hov { Color::from_rgba(100, 50, 50, 255) } else { Color::from_rgba(60, 30, 30, 255) };
+    draw_rectangle(back_x, by, bw, bh, back_bg);
+    draw_rectangle_lines(back_x, by, bw, bh, 2.0, LIGHTGRAY);
+    draw_text("Back", back_x + 36.0, by + bh * 0.68, 16.0, WHITE);
+    if click && back_hov { action = Some("back"); }
+
+    if !status.is_empty() {
+        let col = if status.contains("success") || status.contains("imported") { GREEN } else { YELLOW };
+        draw_text(status, ix, by + bh + 20.0, 15.0, col);
+    }
+
+    action
+}
+
+fn draw_decks_screen(decks: &[SavedDeck], selected: &mut Option<usize>,
+                     mx: f32, my: f32, click: bool) -> Option<&'static str> {
+    let sw = screen_width();
+    let sh = screen_height();
+    clear_background(Color::from_rgba(10, 20, 30, 255));
+
+    let title_fs = (sw * 0.04).clamp(24.0, 48.0);
+    draw_text("Your Decks", 30.0, 50.0, title_fs, GOLD);
+
+    let row_h = 52.0;
+    let row_x = 30.0;
+    let row_w = sw - 60.0;
+    let start_y = 80.0;
+
+    if decks.is_empty() {
+        draw_text("No decks imported yet.", row_x, start_y + 30.0, 16.0, GRAY);
+    }
+
+    for (i, deck) in decks.iter().enumerate() {
+        let ry = start_y + i as f32 * (row_h + 6.0);
+        let is_sel = *selected == Some(i);
+        let hov = in_box(mx, my, row_x, ry, row_w, row_h);
+        let bg = if is_sel  { Color::from_rgba(40, 80, 140, 255) }
+                 else if hov { Color::from_rgba(25, 50,  90, 255) }
+                 else        { Color::from_rgba(15, 30,  55, 255) };
+        draw_rectangle(row_x, ry, row_w, row_h, bg);
+        draw_rectangle_lines(row_x, ry, row_w, row_h, 1.5,
+            if is_sel { GOLD } else { Color::from_rgba(60, 80, 120, 255) });
+
+        draw_text(&deck.name, row_x + 10.0, ry + row_h * 0.42, 17.0, WHITE);
+        let houses = deck.houses.join(" · ");
+        draw_text(&houses, row_x + 10.0, ry + row_h * 0.78, 13.0, LIGHTGRAY);
+        let card_count = format!("{} cards", deck.cards.len());
+        let cw = measure_text(&card_count, None, 13, 1.0).width;
+        draw_text(&card_count, row_x + row_w - cw - 10.0, ry + row_h * 0.60, 13.0, GRAY);
+
+        if click && hov {
+            *selected = Some(i);
+        }
+    }
+
+    // Back button
+    let bw = 120.0;
+    let bh = 36.0;
+    let bx = row_x;
+    let by = sh - bh - 20.0;
+    let back_hov = in_box(mx, my, bx, by, bw, bh);
+    let back_bg  = if back_hov { Color::from_rgba(100, 50, 50, 255) } else { Color::from_rgba(60, 30, 30, 255) };
+    draw_rectangle(bx, by, bw, bh, back_bg);
+    draw_rectangle_lines(bx, by, bw, bh, 2.0, LIGHTGRAY);
+    draw_text("Back", bx + 36.0, by + bh * 0.68, 16.0, WHITE);
+    if click && back_hov { return Some("back"); }
+
+    None
+}
+
+// ---------------------------------------------------------------------------
 // Window config
 // ---------------------------------------------------------------------------
 
@@ -284,17 +527,91 @@ fn window_conf() -> Conf {
 #[macroquad::main(window_conf)]
 async fn main() {
     let addr = std::env::args().nth(1).unwrap_or_else(|| "127.0.0.1:9999".to_string());
-    let mut app = App::connect(&addr);
+    let mut screen = Screen::Menu { status: String::new() };
 
     loop {
+        let (mx, my) = mouse_position();
+        let click    = is_mouse_button_pressed(MouseButton::Left);
+
+        // ---- Menu screen ------------------------------------------------
+        if let Screen::Menu { ref status } = screen {
+            let status_clone = status.clone();
+            let action = draw_menu(&status_clone, mx, my, click);
+            match action {
+                Some("exit")   => std::process::exit(0),
+                Some("find")   => match try_connect(&addr) {
+                    Ok(app) => screen = Screen::InGame(app),
+                    Err(e)  => screen = Screen::Menu { status: format!("Could not connect: {e}") },
+                },
+                Some("import") => screen = Screen::ImportDeck {
+                    url: String::new(), status: String::new(), loading: None,
+                },
+                Some("decks")  => screen = Screen::DecksList {
+                    decks: deck_store::load(), selected: None,
+                },
+                _ => {}
+            }
+            next_frame().await;
+            continue;
+        }
+
+        // ---- Import Deck screen -----------------------------------------
+        if matches!(screen, Screen::ImportDeck { .. }) {
+            // Poll background import thread.
+            if let Screen::ImportDeck { ref mut status, ref mut loading, .. } = screen {
+                if let Some(ref rx) = *loading {
+                    match rx.try_recv() {
+                        Ok(Ok(deck)) => {
+                            deck_store::save_deck(deck);
+                            *status = "Deck imported successfully!".into();
+                            *loading = None;
+                        }
+                        Ok(Err(e)) => { *status = e; *loading = None; }
+                        _ => {}
+                    }
+                }
+            }
+            let action = if let Screen::ImportDeck { ref mut url, ref status, ref loading } = screen {
+                draw_import_screen(url, status, loading.is_some(), mx, my, click)
+            } else { None };
+
+            match action {
+                Some("back") => screen = Screen::Menu { status: String::new() },
+                Some("import") => {
+                    if let Screen::ImportDeck { ref url, ref mut status, ref mut loading } = screen {
+                        let url_clone = url.clone();
+                        let (tx, rx) = mpsc::channel();
+                        std::thread::spawn(move || { let _ = tx.send(vault::fetch_deck(&url_clone)); });
+                        *loading = Some(rx);
+                        *status = "Importing...".into();
+                    }
+                }
+                _ => {}
+            }
+            next_frame().await;
+            continue;
+        }
+
+        // ---- Decks List screen ------------------------------------------
+        if matches!(screen, Screen::DecksList { .. }) {
+            let action = if let Screen::DecksList { ref decks, ref mut selected } = screen {
+                draw_decks_screen(decks, selected, mx, my, click)
+            } else { None };
+            if action == Some("back") {
+                screen = Screen::Menu { status: String::new() };
+            }
+            next_frame().await;
+            continue;
+        }
+
+        let app = match screen { Screen::InGame(ref mut a) => a, _ => unreachable!() };
+
         app.poll();
         clear_background(Color::from_rgba(20, 60, 20, 255));
 
         let l = L::new(screen_width(), screen_height());
         let lfs = l.ch * 0.11;
 
-        let (mx, my) = mouse_position();
-        let click    = is_mouse_button_pressed(MouseButton::Left);
         let released = is_mouse_button_released(MouseButton::Left);
         let rclick   = is_mouse_button_pressed(MouseButton::Right);
 
@@ -323,7 +640,7 @@ async fn main() {
         // ---- Opponent hand (face-down) ----------------------------------
         for i in 0..view.opp_hand_count {
             draw_card(&l, l.cx(i), l.p1_hand_y,
-                "?", "", Color::from_rgba(25, 25, 80, 255), GRAY);
+                "?", "", "", Color::from_rgba(25, 25, 80, 255), GRAY);
         }
         draw_zone(&l, l.deck_x, l.p1_hand_y, "Deck",    view.opp_deck_count,      false);
         draw_zone(&l, l.arch_x, l.p1_hand_y, "Archive", view.opp_archives_count,   false);
@@ -338,7 +655,7 @@ async fn main() {
                      else              { Color::from_rgba(160, 30, 30, 255) };
             let border = if selected { YELLOW } else { DARKGRAY };
             draw_card(&l, x, l.p1_line_y, &card.name,
-                &card_sub_view(card), bg, border);
+                &card.text, &card_sub_view(card), bg, border);
             if i == 0 {
                 draw_flank_badge(&l, x, l.p1_line_y, "◄L", Color::from_rgba(255, 160, 160, 255));
             }
@@ -373,7 +690,7 @@ async fn main() {
                      else              { Color::from_rgba(25, 130, 25, 255) };
             let border = if selected { YELLOW } else { DARKGRAY };
             draw_card(&l, x, l.p0_line_y, &card.name,
-                &card_sub_view(card), bg, border);
+                &card.text, &card_sub_view(card), bg, border);
             if i == 0 {
                 draw_flank_badge(&l, x, l.p0_line_y, "◄L", Color::from_rgba(160, 255, 160, 255));
             }
@@ -461,7 +778,7 @@ async fn main() {
                      else               { Color::from_rgba(20, 20, 50, 255) };
             let border = if selected { WHITE } else if playable { GRAY } else { DARKGRAY };
             draw_card(&l, l.cx(i), l.p0_hand_y,
-                &card.name, &card_sub_view(card), bg, border);
+                &card.name, &card.text, &card_sub_view(card), bg, border);
             if click && l.hit(mx, my, l.cx(i), l.p0_hand_y) && my_turn {
                 app.drag_card = Some(card.id);
                 app.selected_hand = None;
@@ -557,7 +874,7 @@ async fn main() {
             if is_mouse_button_down(MouseButton::Left) {
                 if let Some(card) = view.my_hand.iter().find(|c| c.id == drag_id) {
                     draw_card(&l, mx - l.cw / 2.0, my - l.ch / 2.0,
-                        &card.name, &card_sub_view(card),
+                        &card.name, &card.text, &card_sub_view(card),
                         Color::from_rgba(200, 180, 60, 210), WHITE);
                 }
             }
