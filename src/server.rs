@@ -2,6 +2,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
 
 use crate::card::CardDef;
 use crate::game::{
@@ -116,12 +117,29 @@ pub fn build_game() -> GameState {
     GameState::new(ids0, ids1, all)
 }
 
+/// Enable TCP keepalive so the OS detects dead connections (e.g. NAT timeout).
+fn enable_keepalive(stream: &TcpStream) {
+    use socket2::{Socket, TcpKeepalive};
+    use std::os::unix::io::AsRawFd;
+
+    let socket = unsafe { Socket::from_raw_fd(stream.as_raw_fd()) };
+    let keepalive = TcpKeepalive::new()
+        .with_time(Duration::from_secs(30))   // probe after 30 s idle
+        .with_interval(Duration::from_secs(5)) // retry every 5 s
+        .with_retries(3);                       // give up after 3 failed probes
+    let _ = socket.set_tcp_keepalive(&keepalive);
+    std::mem::forget(socket); // don't close the fd we don't own
+}
+
 /// Run one complete game session between two accepted TCP streams.
 /// Returns when the game ends (GameOver) or either client disconnects.
 ///
 /// Each player gets its own reader thread so messages (including Surrender)
 /// are received in real time regardless of whose turn it is.
 pub fn run_session(stream0: TcpStream, stream1: TcpStream) {
+    enable_keepalive(&stream0);
+    enable_keepalive(&stream1);
+
     let mut streams = [
         stream0.try_clone().expect("clone stream0"),
         stream1.try_clone().expect("clone stream1"),
