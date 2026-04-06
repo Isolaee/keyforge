@@ -710,6 +710,7 @@ mod tests {
         on_fight: &[],
         on_play: &[],
         on_destroyed: &[],
+        text: "",
     };
 
     static ELUSIVE_CREATURE: CardDef = CardDef {
@@ -726,6 +727,7 @@ mod tests {
         on_fight: &[],
         on_play: &[],
         on_destroyed: &[],
+        text: "",
     };
 
     static TAUNT_CREATURE: CardDef = CardDef {
@@ -742,6 +744,7 @@ mod tests {
         on_fight: &[],
         on_play: &[],
         on_destroyed: &[],
+        text: "",
     };
 
     static CAPTURE_CREATURE: CardDef = CardDef {
@@ -758,6 +761,7 @@ mod tests {
         on_fight: &[],
         on_play: &[],
         on_destroyed: &[],
+        text: "",
     };
 
     // High-power variant so the attacker survives to hold captured Aember.
@@ -775,6 +779,7 @@ mod tests {
         on_fight: &[],
         on_play: &[],
         on_destroyed: &[],
+        text: "",
     };
 
     static STEAL_CREATURE: CardDef = CardDef {
@@ -791,6 +796,7 @@ mod tests {
         on_fight: &[],
         on_play: &[],
         on_destroyed: &[],
+        text: "",
     };
 
     static EXALT_CREATURE: CardDef = CardDef {
@@ -807,6 +813,7 @@ mod tests {
         on_fight: &[],
         on_play: &[],
         on_destroyed: &[],
+        text: "",
     };
 
     static DEPLOY_CREATURE: CardDef = CardDef {
@@ -823,6 +830,7 @@ mod tests {
         on_fight: &[],
         on_play: &[],
         on_destroyed: &[],
+        text: "",
     };
 
     static REAP_GAIN_CREATURE: CardDef = CardDef {
@@ -839,6 +847,7 @@ mod tests {
         on_fight: &[],
         on_play: &[Effect::DrawCards(1)],
         on_destroyed: &[Effect::GainAember(1)],
+        text: "Reap: Gain 2 aember. Play: Draw 1 card. Destroyed: Gain 1 aember.",
     };
 
     static FIGHT_DAMAGE_CREATURE: CardDef = CardDef {
@@ -855,6 +864,7 @@ mod tests {
         on_fight: &[Effect::DealDamageToEachEnemy(1)],
         on_play: &[],
         on_destroyed: &[],
+        text: "",
     };
 
     // ---- setup draw ----
@@ -1435,6 +1445,7 @@ mod tests {
         on_fight: &[],
         on_play: &[],
         on_destroyed: &[],
+        text: "",
     };
 
     #[test]
@@ -1467,6 +1478,7 @@ mod tests {
         on_fight: &[],
         on_play: &[],
         on_destroyed: &[],
+        text: "",
     };
 
     #[test]
@@ -1506,6 +1518,7 @@ mod tests {
         on_fight: &[],
         on_play: &[],
         on_destroyed: &[],
+        text: "",
     };
 
     #[test]
@@ -1540,6 +1553,7 @@ mod tests {
         on_fight: &[],
         on_play: &[],
         on_destroyed: &[],
+        text: "",
     };
 
     #[test]
@@ -1667,6 +1681,7 @@ mod tests {
         on_fight: &[Effect::GainAember(5)],
         on_play: &[],
         on_destroyed: &[],
+        text: "",
     };
 
     #[test]
@@ -1739,6 +1754,7 @@ mod tests {
         on_fight: &[],
         on_play: &[],
         on_destroyed: &[],
+        text: "",
     };
 
     #[test]
@@ -1775,6 +1791,7 @@ mod tests {
         on_fight: &[],
         on_play: &[],
         on_destroyed: &[],
+        text: "",
     };
 
     #[test]
@@ -1815,6 +1832,7 @@ mod tests {
         on_fight: &[],
         on_play: &[],
         on_destroyed: &[],
+        text: "",
     };
 
     #[test]
@@ -1870,6 +1888,7 @@ mod tests {
         on_fight: &[],
         on_play: &[],
         on_destroyed: &[],
+        text: "",
     };
 
     static DRAW_ICON_CREATURE: CardDef = CardDef {
@@ -1886,6 +1905,7 @@ mod tests {
         on_fight: &[],
         on_play: &[],
         on_destroyed: &[],
+        text: "",
     };
 
     #[test]
@@ -1927,6 +1947,7 @@ mod tests {
         on_fight: &[],
         on_play: &[],
         on_destroyed: &[],
+        text: "",
     };
 
     static CAPTURE_EFFECT_CREATURE: CardDef = CardDef {
@@ -1943,6 +1964,7 @@ mod tests {
         on_fight: &[],
         on_play: &[],
         on_destroyed: &[],
+        text: "",
     };
 
     static HEAL_SELF_CREATURE: CardDef = CardDef {
@@ -1959,6 +1981,7 @@ mod tests {
         on_fight: &[],
         on_play: &[],
         on_destroyed: &[],
+        text: "",
     };
 
     #[test]
@@ -2019,6 +2042,7 @@ mod tests {
         on_fight: &[Effect::GainAember(3)],
         on_play: &[],
         on_destroyed: &[],
+        text: "",
     };
 
     #[test]

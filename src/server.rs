@@ -1,8 +1,14 @@
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpStream;
+
+use crate::card::CardDef;
 use crate::game::{
     attack, choose_house, end_turn, play_card, play_card_deployed, reap, step_forge_key, unstun,
     GameState,
 };
-use crate::protocol::ClientMessage;
+use crate::protocol::{ClientMessage, ServerMessage};
+use crate::view::to_client_view;
+use crate::{cards, deck};
 
 /// Process one client message on behalf of `player_idx`.
 /// Returns `Ok(())` on success or `Err(reason)` for invalid actions.
@@ -77,6 +83,90 @@ pub fn dispatch_message(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Session helpers
+// ---------------------------------------------------------------------------
+
+fn send_msg(stream: &mut TcpStream, msg: &ServerMessage) -> bool {
+    let mut line = serde_json::to_string(msg).expect("serialize");
+    line.push('\n');
+    stream.write_all(line.as_bytes()).is_ok() && stream.flush().is_ok()
+}
+
+fn recv_msg(reader: &mut BufReader<TcpStream>) -> Option<ClientMessage> {
+    let mut line = String::new();
+    match reader.read_line(&mut line) {
+        Ok(0) | Err(_) => None,
+        Ok(_) => serde_json::from_str(line.trim()).ok(),
+    }
+}
+
+/// Build the default 8-card game used by the server.
+pub fn build_game() -> GameState {
+    let p0: &[&'static CardDef] = &[
+        &cards::TROLL, &cards::SMAAASH, &cards::SILVERTOOTH,
+        &cards::VEZYMA_THINKDRONE, &cards::PLAGUE, &cards::BANNER_OF_BATTLE,
+        &cards::TROLL, &cards::SMAAASH,
+    ];
+    let p1: &[&'static CardDef] = &[
+        &cards::TROLL, &cards::SILVERTOOTH, &cards::SMAAASH,
+        &cards::VEZYMA_THINKDRONE, &cards::PLAGUE, &cards::BANNER_OF_BATTLE,
+        &cards::SILVERTOOTH, &cards::TROLL,
+    ];
+    let (mut all, ids0) = deck::build_deck(p0);
+    let (cards1, ids1) = deck::build_deck(p1);
+    all.extend(cards1);
+    GameState::new(ids0, ids1, all)
+}
+
+/// Run one complete game session between two accepted TCP streams.
+/// Returns when the game ends (GameOver) or either client disconnects.
+pub fn run_session(stream0: TcpStream, stream1: TcpStream) {
+    let mut streams = [
+        stream0.try_clone().expect("clone stream0"),
+        stream1.try_clone().expect("clone stream1"),
+    ];
+    let mut readers = [BufReader::new(stream0), BufReader::new(stream1)];
+
+    if !send_msg(&mut streams[0], &ServerMessage::Welcome { player_index: 0 }) { return; }
+    if !send_msg(&mut streams[1], &ServerMessage::Welcome { player_index: 1 }) { return; }
+
+    let mut game = build_game();
+
+    for i in 0..2 {
+        let view = to_client_view(&game, i);
+        if !send_msg(&mut streams[i], &ServerMessage::GameState(view)) { return; }
+    }
+
+    loop {
+        let ap = game.active_player;
+        let msg = match recv_msg(&mut readers[ap]) {
+            Some(m) => m,
+            None    => { eprintln!("Player {} disconnected.", ap); return; }
+        };
+
+        match dispatch_message(&mut game, ap, msg) {
+            Err(e) => { send_msg(&mut streams[ap], &ServerMessage::Error(e)); }
+            Ok(()) => {
+                for i in 0..2 {
+                    if game.players[i].player.keys.has_won() {
+                        let over = ServerMessage::GameOver { winner: i };
+                        send_msg(&mut streams[0], &over);
+                        send_msg(&mut streams[1], &over);
+                        return;
+                    }
+                }
+                for i in 0..2 {
+                    let view = to_client_view(&game, i);
+                    if !send_msg(&mut streams[i], &ServerMessage::GameState(view)) { return; }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,7 +176,6 @@ mod tests {
     use crate::game::GameState;
     use crate::protocol::ClientMessage;
     use crate::zones::Flank;
-    use std::collections::HashMap;
 
     fn game_with(p0: &[&'static CardDef], p1: &[&'static CardDef]) -> GameState {
         let (mut cards, ids0) = build_deck(p0);
@@ -155,6 +244,7 @@ mod tests {
         on_fight: &[],
         on_play: &[],
         on_destroyed: &[],
+        text: "",
     };
 
     #[test]

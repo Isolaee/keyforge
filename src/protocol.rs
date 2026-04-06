@@ -119,7 +119,7 @@ pub struct ClientGameView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::card::{BonusIcon, CardType, Effect, House, Keyword, Rarity};
+    use crate::card::{BonusIcon, CardType, House, Keyword, Rarity};
     use crate::victory::KeyColor;
     use crate::zones::Flank;
 

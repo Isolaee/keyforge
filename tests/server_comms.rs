@@ -1,352 +1,426 @@
 /// Integration tests for server TCP communications.
 ///
-/// Each test spins up a minimal game server in a background thread, connects
-/// two client streams, and exercises the full request/response cycle over the
-/// wire.
+/// Each test spins up a real game server (`run_session`) in a background
+/// thread, connects two client streams, and exercises the full
+/// request/response cycle over the wire.
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
 
-use keyforge::cards;
-use keyforge::deck;
-use keyforge::game::GameState;
-use keyforge::protocol::{ClientMessage, ClientGameView, ServerMessage};
-use keyforge::server::dispatch_message;
-use keyforge::view::to_client_view;
+use keyforge::card::{BonusIcon, House};
+use keyforge::protocol::{ClientGameView, ClientMessage, ServerMessage};
+use keyforge::server::run_session;
 use keyforge::zones::Flank;
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Bind to an OS-assigned free port and return the listener + port number.
 fn bind_free() -> (TcpListener, u16) {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
     (l, port)
 }
 
-fn connect(port: u16) -> TcpStream {
+fn tcp_connect(port: u16) -> TcpStream {
     TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap()
 }
 
-fn send_msg(stream: &mut TcpStream, msg: &ClientMessage) {
+fn send(stream: &mut TcpStream, msg: &ClientMessage) {
     let mut line = serde_json::to_string(msg).unwrap();
     line.push('\n');
     stream.write_all(line.as_bytes()).unwrap();
     stream.flush().unwrap();
 }
 
-fn recv_msg(reader: &mut BufReader<TcpStream>) -> ServerMessage {
+fn recv(reader: &mut BufReader<TcpStream>) -> ServerMessage {
     let mut line = String::new();
     reader.read_line(&mut line).unwrap();
     serde_json::from_str(line.trim()).expect("invalid server message")
 }
 
-/// Build a deterministic 8-card game (same as the real server's build_game).
-fn make_game() -> GameState {
-    let p0: &[&'static keyforge::card::CardDef] = &[
-        &cards::TROLL, &cards::SMAAASH, &cards::SILVERTOOTH,
-        &cards::VEZYMA_THINKDRONE, &cards::PLAGUE, &cards::BANNER_OF_BATTLE,
-        &cards::TROLL, &cards::SMAAASH,
-    ];
-    let p1: &[&'static keyforge::card::CardDef] = &[
-        &cards::TROLL, &cards::SILVERTOOTH, &cards::SMAAASH,
-        &cards::VEZYMA_THINKDRONE, &cards::PLAGUE, &cards::BANNER_OF_BATTLE,
-        &cards::SILVERTOOTH, &cards::TROLL,
-    ];
-    let (mut all, ids0) = deck::build_deck(p0);
-    let (cards1, ids1) = deck::build_deck(p1);
-    all.extend(cards1);
-    GameState::new(ids0, ids1, all)
-}
 
-/// Run a minimal game server on `listener`.
-/// The server processes exactly `message_limit` client messages then returns.
-fn run_server(listener: TcpListener, message_limit: usize) {
-    let (s0, _) = listener.accept().unwrap();
-    let (s1, _) = listener.accept().unwrap();
-    let mut streams = [s0.try_clone().unwrap(), s1.try_clone().unwrap()];
-    let mut readers = [BufReader::new(s0), BufReader::new(s1)];
-
-    let send = |stream: &mut TcpStream, msg: &ServerMessage| {
-        let mut line = serde_json::to_string(msg).unwrap();
-        line.push('\n');
-        stream.write_all(line.as_bytes()).unwrap();
-        stream.flush().unwrap();
-    };
-
-    // Welcome each player.
-    send(&mut streams[0], &ServerMessage::Welcome { player_index: 0 });
-    send(&mut streams[1], &ServerMessage::Welcome { player_index: 1 });
-
-    let mut game = make_game();
-
-    // Initial game state.
-    for i in 0..2 {
-        let view = to_client_view(&game, i);
-        send(&mut streams[i], &ServerMessage::GameState(view));
-    }
-
-    // Message loop.
-    let mut processed = 0;
-    while processed < message_limit {
-        let ap = game.active_player;
-        let mut line = String::new();
-        match readers[ap].read_line(&mut line) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
-        let msg: ClientMessage = match serde_json::from_str(line.trim()) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-
-        match dispatch_message(&mut game, ap, msg) {
-            Err(e) => {
-                send(&mut streams[ap], &ServerMessage::Error(e));
-            }
-            Ok(()) => {
-                // Check win condition.
-                for i in 0..2 {
-                    if game.players[i].player.keys.has_won() {
-                        let winner_msg = ServerMessage::GameOver { winner: i };
-                        send(&mut streams[0], &winner_msg);
-                        send(&mut streams[1], &winner_msg);
-                        return;
-                    }
-                }
-                // Broadcast updated state.
-                for i in 0..2 {
-                    let view = to_client_view(&game, i);
-                    send(&mut streams[i], &ServerMessage::GameState(view));
-                }
-            }
-        }
-        processed += 1;
-    }
-}
-
-fn extract_game_state(msg: ServerMessage) -> ClientGameView {
+fn expect_game_state(msg: ServerMessage) -> ClientGameView {
     match msg {
         ServerMessage::GameState(v) => v,
         other => panic!("expected GameState, got {:?}", other),
     }
 }
 
+/// Spawn `run_session` for one pair of clients in a background thread.
+/// Returns a channel that receives `()` when the session ends.
+fn spawn_session(listener: TcpListener) -> mpsc::Receiver<()> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (s0, _) = listener.accept().unwrap();
+        let (s1, _) = listener.accept().unwrap();
+        run_session(s0, s1);
+        let _ = tx.send(());
+    });
+    rx
+}
+
+/// Spawn a server that handles `n` sequential sessions.
+fn spawn_n_sessions(listener: TcpListener, n: usize) -> mpsc::Receiver<()> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        for _ in 0..n {
+            let (s0, _) = listener.accept().unwrap();
+            let (s1, _) = listener.accept().unwrap();
+            run_session(s0, s1);
+        }
+        let _ = tx.send(());
+    });
+    rx
+}
+
+/// Connect two clients and consume welcome + initial game-state messages.
+/// Returns `(stream0, reader0, view0, stream1, reader1, view1)`.
+fn handshake(port: u16) -> (TcpStream, BufReader<TcpStream>, ClientGameView,
+                             TcpStream, BufReader<TcpStream>, ClientGameView) {
+    let s0 = tcp_connect(port);
+    let s1 = tcp_connect(port);
+    let mut r0 = BufReader::new(s0.try_clone().unwrap());
+    let mut r1 = BufReader::new(s1.try_clone().unwrap());
+    recv(&mut r0); // Welcome{0}
+    recv(&mut r1); // Welcome{1}
+    let v0 = expect_game_state(recv(&mut r0));
+    let v1 = expect_game_state(recv(&mut r1));
+    (s0, r0, v0, s1, r1, v1)
+}
+
 // ---------------------------------------------------------------------------
-// Tests
+// Matchmaking
 // ---------------------------------------------------------------------------
 
-/// Server sends Welcome with correct player_index to each connection.
+/// Server sends Welcome{player_index:0} to the first connector and
+/// Welcome{player_index:1} to the second.
 #[test]
-fn test_welcome_player_indices() {
+fn test_matchmaking_correct_player_indices() {
     let (listener, port) = bind_free();
-    thread::spawn(move || run_server(listener, 0));
+    spawn_session(listener);
 
-    let s0 = connect(port);
-    let s1 = connect(port);
+    let s0 = tcp_connect(port);
+    let s1 = tcp_connect(port);
     let mut r0 = BufReader::new(s0);
     let mut r1 = BufReader::new(s1);
 
-    let w0 = recv_msg(&mut r0);
-    let w1 = recv_msg(&mut r1);
+    let w0 = recv(&mut r0);
+    let w1 = recv(&mut r1);
 
     assert!(matches!(w0, ServerMessage::Welcome { player_index: 0 }));
     assert!(matches!(w1, ServerMessage::Welcome { player_index: 1 }));
 }
 
-/// Each player receives an initial GameState immediately after connecting.
+/// After both players connect each receives an initial GameState.
 #[test]
-fn test_initial_game_state_sent_to_both() {
+fn test_matchmaking_initial_state_sent_to_both() {
     let (listener, port) = bind_free();
-    thread::spawn(move || run_server(listener, 0));
+    spawn_session(listener);
 
-    let s0 = connect(port);
-    let s1 = connect(port);
+    let s0 = tcp_connect(port);
+    let s1 = tcp_connect(port);
     let mut r0 = BufReader::new(s0);
     let mut r1 = BufReader::new(s1);
 
-    recv_msg(&mut r0); // Welcome
-    recv_msg(&mut r1); // Welcome
+    recv(&mut r0); // Welcome
+    recv(&mut r1);
 
-    let v0 = extract_game_state(recv_msg(&mut r0));
-    let v1 = extract_game_state(recv_msg(&mut r1));
+    let v0 = expect_game_state(recv(&mut r0));
+    let v1 = expect_game_state(recv(&mut r1));
 
     assert_eq!(v0.my_index, 0);
     assert_eq!(v1.my_index, 1);
     assert_eq!(v0.active_player, 0);
-    assert_eq!(v1.active_player, 0);
     assert_eq!(v0.turn, 1);
-    // P0 drew 7, P1 drew 6 (setup rule).
+    // Setup draw: P0 draws 7, P1 draws 6.
     assert_eq!(v0.my_hand.len(), 7);
-    assert_eq!(v0.opp_hand_count, 6);
     assert_eq!(v1.my_hand.len(), 6);
-    assert_eq!(v1.opp_hand_count, 7);
-}
-
-/// P0 sends ChooseHouse; both players receive an updated GameState.
-#[test]
-fn test_choose_house_updates_both_views() {
-    let (listener, port) = bind_free();
-    thread::spawn(move || run_server(listener, 1));
-
-    let mut s0 = connect(port);
-    let s1 = connect(port);
-    let mut r0 = BufReader::new(s0.try_clone().unwrap());
-    let mut r1 = BufReader::new(s1);
-
-    recv_msg(&mut r0); // Welcome 0
-    recv_msg(&mut r1); // Welcome 1
-    recv_msg(&mut r0); // initial GameState 0
-    recv_msg(&mut r1); // initial GameState 1
-
-    send_msg(&mut s0, &ClientMessage::ChooseHouse {
-        house: keyforge::card::House::Brobnar,
-        pick_up_archives: false,
-    });
-
-    let v0 = extract_game_state(recv_msg(&mut r0));
-    let v1 = extract_game_state(recv_msg(&mut r1));
-
-    assert_eq!(v0.active_house, Some(keyforge::card::House::Brobnar));
-    assert_eq!(v1.active_house, Some(keyforge::card::House::Brobnar));
-}
-
-/// Sending a valid PlayCard moves the card to the battleline and updates both views.
-#[test]
-fn test_play_card_updates_battleline() {
-    let (listener, port) = bind_free();
-    thread::spawn(move || run_server(listener, 2)); // ChooseHouse + PlayCard
-
-    let mut s0 = connect(port);
-    let s1 = connect(port);
-    let mut r0 = BufReader::new(s0.try_clone().unwrap());
-    let mut r1 = BufReader::new(s1);
-
-    recv_msg(&mut r0);
-    recv_msg(&mut r1);
-    let initial_v0 = extract_game_state(recv_msg(&mut r0));
-    recv_msg(&mut r1);
-
-    // Choose Brobnar to allow playing Troll/Smaaash.
-    send_msg(&mut s0, &ClientMessage::ChooseHouse {
-        house: keyforge::card::House::Brobnar,
-        pick_up_archives: false,
-    });
-    let v0_after_house = extract_game_state(recv_msg(&mut r0));
-    recv_msg(&mut r1); // P1's updated view
-
-    // Find a Brobnar card in hand.
-    let brobnar_card = v0_after_house
-        .my_hand
-        .iter()
-        .find(|c| c.house == keyforge::card::House::Brobnar)
-        .expect("no Brobnar card in hand");
-    let card_id = brobnar_card.id;
-
-    send_msg(&mut s0, &ClientMessage::PlayCard { card_id, flank: Flank::Left });
-    let v0_after_play = extract_game_state(recv_msg(&mut r0));
-
-    assert!(!v0_after_play.my_hand.iter().any(|c| c.id == card_id));
-    assert!(v0_after_play.my_battleline.iter().any(|c| c.id == card_id));
-    // Hand shrunk by 1.
-    assert_eq!(v0_after_play.my_hand.len(), initial_v0.my_hand.len() - 1);
-}
-
-/// Invalid action (card not in hand) returns Error; no GameState is sent.
-#[test]
-fn test_invalid_play_card_returns_error() {
-    let (listener, port) = bind_free();
-    thread::spawn(move || run_server(listener, 1));
-
-    let mut s0 = connect(port);
-    let s1 = connect(port);
-    let mut r0 = BufReader::new(s0.try_clone().unwrap());
-    let mut r1 = BufReader::new(s1.try_clone().unwrap());
-
-    recv_msg(&mut r0);
-    recv_msg(&mut r1);
-    recv_msg(&mut r0);
-    recv_msg(&mut r1);
-
-    send_msg(&mut s0, &ClientMessage::PlayCard { card_id: 999999, flank: Flank::Left });
-
-    let response = recv_msg(&mut r0);
-    assert!(matches!(response, ServerMessage::Error(_)));
-}
-
-/// EndTurn switches the active player in the subsequent GameState.
-#[test]
-fn test_end_turn_switches_active_player() {
-    let (listener, port) = bind_free();
-    thread::spawn(move || run_server(listener, 1));
-
-    let mut s0 = connect(port);
-    let s1 = connect(port);
-    let mut r0 = BufReader::new(s0.try_clone().unwrap());
-    let mut r1 = BufReader::new(s1);
-
-    recv_msg(&mut r0);
-    recv_msg(&mut r1);
-    recv_msg(&mut r0);
-    recv_msg(&mut r1);
-
-    send_msg(&mut s0, &ClientMessage::EndTurn);
-
-    let v0 = extract_game_state(recv_msg(&mut r0));
-    let v1 = extract_game_state(recv_msg(&mut r1));
-
-    assert_eq!(v0.active_player, 1);
-    assert_eq!(v1.active_player, 1);
-    assert_eq!(v0.turn, 2);
-}
-
-/// P0's view hides P1's hand contents but exposes the correct card count.
-#[test]
-fn test_opponent_hand_hidden_in_view() {
-    let (listener, port) = bind_free();
-    thread::spawn(move || run_server(listener, 0));
-
-    let s0 = connect(port);
-    let s1 = connect(port);
-    let mut r0 = BufReader::new(s0);
-    let mut r1 = BufReader::new(s1);
-
-    recv_msg(&mut r0);
-    recv_msg(&mut r1);
-    let v0 = extract_game_state(recv_msg(&mut r0));
-    let v1 = extract_game_state(recv_msg(&mut r1));
-
-    // P0 sees P1's hand as a count only; P1 sees its own full hand.
     assert_eq!(v0.opp_hand_count, v1.my_hand.len());
     assert_eq!(v1.opp_hand_count, v0.my_hand.len());
 }
 
-/// Server sends GameOver to both players when a player forges all three keys.
+/// Opponent's hand is hidden (count only) in each player's view.
 #[test]
-fn test_game_over_sent_on_win() {
+fn test_matchmaking_opponent_hand_hidden() {
     let (listener, port) = bind_free();
-    thread::spawn(move || run_server(listener, 1));
+    spawn_session(listener);
 
-    let mut s0 = connect(port);
-    let s1 = connect(port);
-    let mut r0 = BufReader::new(s0.try_clone().unwrap());
+    let (_, _r0, v0, _, _r1, v1) = handshake(port);
+
+    assert_eq!(v0.opp_hand_count, v1.my_hand.len());
+    assert_eq!(v1.opp_hand_count, v0.my_hand.len());
+    // my_hand is always a full CardView slice
+    assert!(!v0.my_hand.is_empty());
+    assert!(!v1.my_hand.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Game handling — actions
+// ---------------------------------------------------------------------------
+
+/// ChooseHouse broadcasts an updated GameState with the chosen house set.
+#[test]
+fn test_game_choose_house_broadcasts_update() {
+    let (listener, port) = bind_free();
+    spawn_session(listener);
+
+    let (mut s0, mut r0, _, _, mut r1, _) = handshake(port);
+
+    send(&mut s0, &ClientMessage::ChooseHouse { house: House::Brobnar, pick_up_archives: false });
+
+    let v0 = expect_game_state(recv(&mut r0));
+    let v1 = expect_game_state(recv(&mut r1));
+
+    assert_eq!(v0.active_house, Some(House::Brobnar));
+    assert_eq!(v1.active_house, Some(House::Brobnar));
+}
+
+/// Playing a card removes it from hand and places it on the battleline.
+#[test]
+fn test_game_play_card_updates_battleline() {
+    let (listener, port) = bind_free();
+    spawn_session(listener);
+
+    let (mut s0, mut r0, _, _, mut r1, _) = handshake(port);
+
+    send(&mut s0, &ClientMessage::ChooseHouse { house: House::Brobnar, pick_up_archives: false });
+    let v0 = expect_game_state(recv(&mut r0));
+    recv(&mut r1);
+
+    let card = v0.my_hand.iter()
+        .find(|c| c.house == House::Brobnar)
+        .expect("no Brobnar card in hand");
+    let id = card.id;
+
+    send(&mut s0, &ClientMessage::PlayCard { card_id: id, flank: Flank::Left });
+    let v0 = expect_game_state(recv(&mut r0));
+
+    assert!(!v0.my_hand.iter().any(|c| c.id == id), "card still in hand after play");
+    assert!(v0.my_battleline.iter().any(|c| c.id == id), "card not on battleline after play");
+}
+
+/// Reaping a creature exhausts it and grants aember (1 base + bonus icons).
+#[test]
+fn test_game_reap_grants_aember_and_exhausts() {
+    let (listener, port) = bind_free();
+    spawn_session(listener);
+
+    let (mut s0, mut r0, _, _, mut r1, _) = handshake(port);
+
+    // Choose Brobnar.
+    send(&mut s0, &ClientMessage::ChooseHouse { house: House::Brobnar, pick_up_archives: false });
+    let v0 = expect_game_state(recv(&mut r0));
+    recv(&mut r1);
+
+    // Play a Brobnar creature with an aember bonus icon (Troll).
+    let card = v0.my_hand.iter()
+        .find(|c| c.house == House::Brobnar && c.bonus_icons.contains(&BonusIcon::Aember))
+        .expect("no Brobnar card with aember bonus icon in hand");
+    let id = card.id;
+    send(&mut s0, &ClientMessage::PlayCard { card_id: id, flank: Flank::Left });
+    recv(&mut r0);
+    recv(&mut r1);
+
+    // Reap with it.
+    send(&mut s0, &ClientMessage::Reap { card_id: id });
+    let v0 = expect_game_state(recv(&mut r0));
+
+    let creature = v0.my_battleline.iter().find(|c| c.id == id).unwrap();
+    assert!(creature.exhausted, "creature should be exhausted after reaping");
+    // 1 base reap + 1 bonus icon (Troll has BonusIcon::Aember)
+    assert!(v0.my_player.aember_pool >= 2, "expected at least 2 aember after reap");
+}
+
+/// EndTurn increments the turn counter and switches the active player in both views.
+#[test]
+fn test_game_end_turn_switches_player_and_increments_turn() {
+    let (listener, port) = bind_free();
+    spawn_session(listener);
+
+    let (mut s0, mut r0, _, _, mut r1, _) = handshake(port);
+
+    send(&mut s0, &ClientMessage::EndTurn);
+
+    let v0 = expect_game_state(recv(&mut r0));
+    let v1 = expect_game_state(recv(&mut r1));
+
+    assert_eq!(v0.active_player, 1);
+    assert_eq!(v1.active_player, 1);
+    assert_eq!(v0.turn, 2);
+    assert_eq!(v1.turn, 2);
+}
+
+/// Sending an invalid card id (not in hand) returns an Error; no GameState is sent.
+#[test]
+fn test_game_invalid_action_returns_error_not_game_state() {
+    let (listener, port) = bind_free();
+    spawn_session(listener);
+
+    let (mut s0, mut r0, _, _, _, _) = handshake(port);
+
+    send(&mut s0, &ClientMessage::PlayCard { card_id: 999_999, flank: Flank::Left });
+
+    assert!(matches!(recv(&mut r0), ServerMessage::Error(_)));
+}
+
+// ---------------------------------------------------------------------------
+// Game handling — inactive player
+// ---------------------------------------------------------------------------
+
+/// Messages sent by the inactive player are buffered and processed once they
+/// become active. The active player's turn is unaffected.
+#[test]
+fn test_game_inactive_player_message_queued() {
+    let (listener, port) = bind_free();
+    spawn_session(listener);
+
+    let (mut s0, mut r0, _, mut s1, mut r1, _) = handshake(port);
+
+    // P1 sends EndTurn while P0 is still active — it gets buffered.
+    send(&mut s1, &ClientMessage::EndTurn);
+
+    // P0 ends their turn: active player becomes P1.
+    send(&mut s0, &ClientMessage::EndTurn);
+    let v0 = expect_game_state(recv(&mut r0));
+    let _v1 = expect_game_state(recv(&mut r1));
+    assert_eq!(v0.active_player, 1, "P1 should now be active");
+
+    // Server now reads P1's buffered EndTurn: active player returns to P0.
+    let v0 = expect_game_state(recv(&mut r0));
+    let _v1 = expect_game_state(recv(&mut r1));
+    assert_eq!(v0.active_player, 0, "P0 should be active after P1's buffered EndTurn");
+    assert_eq!(v0.turn, 3);
+}
+
+// ---------------------------------------------------------------------------
+// Game handling — win condition
+// ---------------------------------------------------------------------------
+
+/// EndTurn with no win condition → GameState, not GameOver.
+#[test]
+fn test_game_no_premature_game_over() {
+    let (listener, port) = bind_free();
+    spawn_session(listener);
+
+    let (mut s0, mut r0, _, _, _, _) = handshake(port);
+
+    send(&mut s0, &ClientMessage::EndTurn);
+    assert!(matches!(recv(&mut r0), ServerMessage::GameState(_)));
+}
+
+// ---------------------------------------------------------------------------
+// Disconnect handling
+// ---------------------------------------------------------------------------
+
+/// Dropping P0's connection causes the session to exit cleanly (no panic).
+#[test]
+fn test_disconnect_p0_ends_session_cleanly() {
+    let (listener, port) = bind_free();
+    let done = spawn_session(listener);
+
+    let (s0, r0, _, _, r1, _) = handshake(port);
+
+    drop(s0); // disconnect P0
+    drop(r0);
+
+    done.recv_timeout(Duration::from_secs(3))
+        .expect("server did not exit after P0 disconnected");
+    let _ = r1;
+}
+
+/// Dropping P1's connection causes the session to exit cleanly.
+#[test]
+fn test_disconnect_p1_ends_session_cleanly() {
+    let (listener, port) = bind_free();
+    let done = spawn_session(listener);
+
+    let (mut s0, mut r0, _, s1, mut r1, _) = handshake(port);
+
+    // P0 ends turn so P1 becomes active — server will next read from P1.
+    send(&mut s0, &ClientMessage::EndTurn);
+    recv(&mut r0);
+    recv(&mut r1);
+
+    drop(s1); // disconnect P1 while it's their turn
+    drop(r1);
+
+    done.recv_timeout(Duration::from_secs(3))
+        .expect("server did not exit after P1 disconnected");
+    let _ = r0;
+}
+
+// ---------------------------------------------------------------------------
+// Persistence — server stays up after a game ends
+// ---------------------------------------------------------------------------
+
+/// After one game session ends (both clients disconnect), the server accepts
+/// a second pair of clients and matches them into a new game.
+#[test]
+fn test_server_accepts_second_match_after_first_ends() {
+    let (listener, port) = bind_free();
+    let done = spawn_n_sessions(listener, 2);
+
+    // Game 1: connect and immediately disconnect.
+    {
+        let s0 = tcp_connect(port);
+        let s1 = tcp_connect(port);
+        let mut r0 = BufReader::new(s0);
+        let mut r1 = BufReader::new(s1);
+        recv(&mut r0); // Welcome
+        recv(&mut r1);
+        recv(&mut r0); // GameState
+        recv(&mut r1);
+        // Streams drop here → session 1 ends.
+    }
+
+    // Game 2: fresh pair connects and gets welcomed.
+    let s0 = tcp_connect(port);
+    let s1 = tcp_connect(port);
+    let mut r0 = BufReader::new(s0);
     let mut r1 = BufReader::new(s1);
 
-    recv_msg(&mut r0);
-    recv_msg(&mut r1);
-    recv_msg(&mut r0);
-    recv_msg(&mut r1);
+    let w0 = recv(&mut r0);
+    let w1 = recv(&mut r1);
 
-    // Manually trigger win: we need to get the game into a won state. The
-    // simplest path via the protocol is EndTurn — step_forge_key runs for the
-    // new active player. Pre-load P1 (will be active after EndTurn) with 18
-    // aember so it forges immediately… but we can't mutate game state from here.
-    //
-    // Instead we test that EndTurn produces GameState (not GameOver) when no
-    // player has won yet, confirming the GameOver path doesn't fire spuriously.
-    send_msg(&mut s0, &ClientMessage::EndTurn);
-    let response = recv_msg(&mut r0);
-    // No win condition met → GameState (not GameOver).
-    assert!(matches!(response, ServerMessage::GameState(_)));
+    assert!(matches!(w0, ServerMessage::Welcome { player_index: 0 }));
+    assert!(matches!(w1, ServerMessage::Welcome { player_index: 1 }));
+
+    // Both get an initial GameState for game 2.
+    assert!(matches!(recv(&mut r0), ServerMessage::GameState(_)));
+    assert!(matches!(recv(&mut r1), ServerMessage::GameState(_)));
+
+    drop(r0);
+    drop(r1);
+    // Let the server thread exit so test harness doesn't leak threads.
+    let _ = done.recv_timeout(Duration::from_secs(3));
+}
+
+/// Three sequential games all get correct initial state, confirming the server
+/// resets cleanly between sessions.
+#[test]
+fn test_server_resets_game_state_between_sessions() {
+    let (listener, port) = bind_free();
+    spawn_n_sessions(listener, 3);
+
+    for game_no in 0..3u32 {
+        let s0 = tcp_connect(port);
+        let s1 = tcp_connect(port);
+        let mut r0 = BufReader::new(s0);
+        let mut r1 = BufReader::new(s1);
+
+        recv(&mut r0); // Welcome
+        recv(&mut r1);
+        let v0 = expect_game_state(recv(&mut r0));
+        let v1 = expect_game_state(recv(&mut r1));
+
+        assert_eq!(v0.turn, 1, "game {} should start at turn 1", game_no + 1);
+        assert_eq!(v0.active_player, 0, "game {} P0 should be active first", game_no + 1);
+        assert_eq!(v0.my_player.aember_pool, 0);
+        assert_eq!(v1.my_player.aember_pool, 0);
+        // Streams drop → session ends, server loops.
+    }
 }

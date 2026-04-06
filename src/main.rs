@@ -580,7 +580,6 @@ fn handle_text_input(text: &mut String) {
 fn draw_import_screen(url: &mut String, status: &str, loading: bool,
                       mx: f32, my: f32, click: bool) -> Option<&'static str> {
     let sw = screen_width();
-    let sh = screen_height();
     clear_background(Color::from_rgba(10, 20, 30, 255));
 
     let title_fs = (sw * 0.04).clamp(24.0, 48.0);
