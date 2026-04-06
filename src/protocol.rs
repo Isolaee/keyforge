@@ -20,6 +20,7 @@ pub enum ClientMessage {
     Unstun { card_id: CardId },
     DiscardFromHand { card_id: CardId },
     EndTurn,
+    Surrender,
 }
 
 // ---------------------------------------------------------------------------

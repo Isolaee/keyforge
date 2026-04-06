@@ -271,29 +271,26 @@ fn test_game_invalid_action_returns_error_not_game_state() {
 // Game handling — inactive player
 // ---------------------------------------------------------------------------
 
-/// Messages sent by the inactive player are buffered and processed once they
-/// become active. The active player's turn is unaffected.
+/// Messages from the inactive player (other than Surrender) are ignored.
+/// The active player's turn is unaffected.
 #[test]
-fn test_game_inactive_player_message_queued() {
+fn test_game_inactive_player_non_surrender_ignored() {
     let (listener, port) = bind_free();
     spawn_session(listener);
 
     let (mut s0, mut r0, _, mut s1, mut r1, _) = handshake(port);
 
-    // P1 sends EndTurn while P0 is still active — it gets buffered.
+    // P1 sends EndTurn while P0 is still active — server ignores it.
     send(&mut s1, &ClientMessage::EndTurn);
 
-    // P0 ends their turn: active player becomes P1.
+    // P0 ends their turn legitimately.
     send(&mut s0, &ClientMessage::EndTurn);
     let v0 = expect_game_state(recv(&mut r0));
     let _v1 = expect_game_state(recv(&mut r1));
-    assert_eq!(v0.active_player, 1, "P1 should now be active");
 
-    // Server now reads P1's buffered EndTurn: active player returns to P0.
-    let v0 = expect_game_state(recv(&mut r0));
-    let _v1 = expect_game_state(recv(&mut r1));
-    assert_eq!(v0.active_player, 0, "P0 should be active after P1's buffered EndTurn");
-    assert_eq!(v0.turn, 3);
+    // Only P0's EndTurn was processed: turn is 2, P1 is now active.
+    assert_eq!(v0.turn, 2);
+    assert_eq!(v0.active_player, 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -351,6 +348,89 @@ fn test_disconnect_p1_ends_session_cleanly() {
     done.recv_timeout(Duration::from_secs(3))
         .expect("server did not exit after P1 disconnected");
     let _ = r0;
+}
+
+/// Surrender from the active player immediately ends the match: both players
+/// receive GameOver with the surrendering player as the loser.
+#[test]
+fn test_surrender_ends_match_immediately() {
+    let (listener, port) = bind_free();
+    spawn_session(listener);
+
+    let (mut s0, mut r0, _, _, mut r1, _) = handshake(port);
+
+    send(&mut s0, &ClientMessage::Surrender);
+
+    let msg0 = recv(&mut r0);
+    let msg1 = recv(&mut r1);
+
+    assert!(matches!(msg0, ServerMessage::GameOver { winner: 1 }),
+        "surrendering player should lose: {:?}", msg0);
+    assert!(matches!(msg1, ServerMessage::GameOver { winner: 1 }),
+        "opponent should be declared winner: {:?}", msg1);
+}
+
+/// Surrender from the inactive player is processed immediately — P0 does not
+/// need to take any action first.
+#[test]
+fn test_surrender_inactive_player_immediate() {
+    let (listener, port) = bind_free();
+    spawn_session(listener);
+
+    let (_, mut r0, _, mut s1, mut r1, _) = handshake(port);
+
+    // P1 surrenders while inactive — server handles it in real time.
+    send(&mut s1, &ClientMessage::Surrender);
+
+    let msg0 = recv(&mut r0);
+    let msg1 = recv(&mut r1);
+
+    assert!(matches!(msg0, ServerMessage::GameOver { winner: 0 }),
+        "P0 should be declared winner: {:?}", msg0);
+    assert!(matches!(msg1, ServerMessage::GameOver { winner: 0 }),
+        "surrendering P1 should lose: {:?}", msg1);
+}
+
+/// When P0 (active player) disconnects, the surviving player P1 receives
+/// GameOver declaring P1 the winner.
+#[test]
+fn test_disconnect_active_player_sends_gameover_to_survivor() {
+    let (listener, port) = bind_free();
+    spawn_session(listener);
+
+    let (s0, r0, _, _, mut r1, _) = handshake(port);
+
+    drop(s0);
+    drop(r0);
+
+    let msg = recv(&mut r1);
+    assert!(
+        matches!(msg, ServerMessage::GameOver { winner: 1 }),
+        "expected GameOver{{winner:1}}, got {:?}", msg
+    );
+}
+
+/// When the inactive player P1 disconnects (detected during state broadcast),
+/// P0 receives GameOver declaring P0 the winner.
+#[test]
+fn test_disconnect_inactive_player_sends_gameover_to_survivor() {
+    let (listener, port) = bind_free();
+    spawn_session(listener);
+
+    let (mut s0, mut r0, _, s1, r1, _) = handshake(port);
+
+    // Drop P1 while P0 is still active.
+    drop(s1);
+    drop(r1);
+
+    // P0 acts — server broadcasts state, detects P1 is gone, sends GameOver to P0.
+    send(&mut s0, &ClientMessage::EndTurn);
+
+    let msg = recv(&mut r0);
+    assert!(
+        matches!(msg, ServerMessage::GameOver { winner: 0 }),
+        "expected GameOver{{winner:0}}, got {:?}", msg
+    );
 }
 
 // ---------------------------------------------------------------------------

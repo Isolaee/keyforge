@@ -500,6 +500,9 @@ enum Screen {
     },
     DecksList { decks: Vec<SavedDeck>, selected: Option<usize> },
     InGame(App),
+    InGameMenu(App),
+    Settings(App),
+    PostMatch { won: bool },
 }
 
 fn try_connect(addr: &str) -> Result<App, String> {
@@ -697,6 +700,137 @@ fn draw_decks_screen(decks: &[SavedDeck], selected: &mut Option<usize>,
     None
 }
 
+fn draw_ingame_menu(mx: f32, my: f32, click: bool) -> Option<&'static str> {
+    let sw = screen_width();
+    let sh = screen_height();
+
+    // Semi-transparent overlay over the game
+    draw_rectangle(0.0, 0.0, sw, sh, Color::from_rgba(0, 0, 0, 160));
+
+    let pw = (sw * 0.28).clamp(200.0, 320.0);
+    let ph = (sh * 0.42).clamp(230.0, 350.0);
+    let px = (sw - pw) / 2.0;
+    let py = (sh - ph) / 2.0;
+
+    draw_rectangle(px, py, pw, ph, Color::from_rgba(18, 18, 42, 248));
+    draw_rectangle_lines(px, py, pw, ph, 2.0, Color::from_rgba(100, 100, 180, 255));
+
+    let title_fs = ph * 0.10;
+    let tw = measure_text("PAUSED", None, title_fs as u16, 1.0).width;
+    draw_text("PAUSED", px + (pw - tw) / 2.0, py + ph * 0.18, title_fs, GOLD);
+    draw_line(px + pw * 0.1, py + ph * 0.24, px + pw * 0.9, py + ph * 0.24,
+        1.0, Color::from_rgba(80, 80, 140, 255));
+
+    let bw = pw * 0.72;
+    let bh = ph * 0.14;
+    let bx = px + (pw - bw) / 2.0;
+    let gap = ph * 0.045;
+    let start_y = py + ph * 0.32;
+
+    let buttons: &[(&str, &str, Color, Color)] = &[
+        ("Continue",  "continue",  Color::from_rgba(30, 100,  30, 255), Color::from_rgba(50, 160,  50, 255)),
+        ("Settings",  "settings",  Color::from_rgba(30,  60, 130, 255), Color::from_rgba(50, 100, 180, 255)),
+        ("Surrender", "surrender", Color::from_rgba(120,  25,  25, 255), Color::from_rgba(180,  40,  40, 255)),
+    ];
+
+    let mut action = None;
+    for (i, (label, id, bg_normal, bg_hover)) in buttons.iter().enumerate() {
+        let by  = start_y + i as f32 * (bh + gap);
+        let hov = in_box(mx, my, bx, by, bw, bh);
+        let bg  = if hov { *bg_hover } else { *bg_normal };
+        draw_rectangle(bx, by, bw, bh, bg);
+        draw_rectangle_lines(bx, by, bw, bh, 1.5, Color::from_rgba(180, 180, 220, 180));
+        let fs = bh * 0.50;
+        let lw = measure_text(label, None, fs as u16, 1.0).width;
+        draw_text(label, bx + (bw - lw) / 2.0, by + bh * 0.68, fs, WHITE);
+        if click && hov { action = Some(*id); }
+    }
+
+    // Hint
+    let hint = "ESC to continue";
+    let hfs  = ph * 0.055;
+    let hw   = measure_text(hint, None, hfs as u16, 1.0).width;
+    draw_text(hint, px + (pw - hw) / 2.0, py + ph * 0.96, hfs,
+        Color::from_rgba(120, 120, 160, 255));
+
+    action
+}
+
+fn draw_settings(mx: f32, my: f32, click: bool) -> Option<&'static str> {
+    let sw = screen_width();
+    let sh = screen_height();
+    clear_background(Color::from_rgba(10, 15, 25, 255));
+
+    let title_fs = (sw * 0.04).clamp(24.0, 48.0);
+    draw_text("Settings", 30.0, 50.0, title_fs, GOLD);
+    draw_line(30.0, 62.0, sw - 30.0, 62.0, 1.5, Color::from_rgba(80, 80, 120, 255));
+
+    draw_text("No settings available yet.", 30.0, 100.0, 17.0, GRAY);
+
+    let bw = 120.0;
+    let bh = 36.0;
+    let bx = 30.0;
+    let by = sh - bh - 20.0;
+    let hov = in_box(mx, my, bx, by, bw, bh);
+    let bg  = if hov { Color::from_rgba(100, 50, 50, 255) } else { Color::from_rgba(60, 30, 30, 255) };
+    draw_rectangle(bx, by, bw, bh, bg);
+    draw_rectangle_lines(bx, by, bw, bh, 2.0, LIGHTGRAY);
+    draw_text("Back", bx + 36.0, by + bh * 0.68, 16.0, WHITE);
+    if click && hov { return Some("back"); }
+
+    None
+}
+
+fn draw_post_match(won: bool, mx: f32, my: f32, click: bool) -> bool {
+    let sw = screen_width();
+    let sh = screen_height();
+
+    let bg = if won {
+        Color::from_rgba(10, 30, 10, 255)
+    } else {
+        Color::from_rgba(25, 10, 10, 255)
+    };
+    clear_background(bg);
+
+    // Decorative horizontal bars
+    let bar_col = if won { Color::from_rgba(180, 140, 0, 60) } else { Color::from_rgba(140, 20, 20, 60) };
+    draw_rectangle(0.0, sh * 0.30, sw, 2.0, bar_col);
+    draw_rectangle(0.0, sh * 0.70, sw, 2.0, bar_col);
+
+    // Main result text
+    let (result, result_col, sub) = if won {
+        ("VICTORY", GOLD, "You have forged all three keys.")
+    } else {
+        ("DEFEATED", Color::from_rgba(200, 50, 50, 255), "Your opponent forged all three keys.")
+    };
+
+    let rfs = (sw * 0.10).clamp(48.0, 110.0);
+    let rw  = measure_text(result, None, rfs as u16, 1.0).width;
+    draw_text(result, (sw - rw) / 2.0, sh * 0.42, rfs, result_col);
+
+    let sfs = (sw * 0.025).clamp(14.0, 26.0);
+    let sw2 = measure_text(sub, None, sfs as u16, 1.0).width;
+    draw_text(sub, (sw - sw2) / 2.0, sh * 0.52, sfs,
+        Color::from_rgba(180, 180, 180, 255));
+
+    // Continue button
+    let bw = (sw * 0.20).clamp(140.0, 220.0);
+    let bh = (sh * 0.07).clamp(38.0, 56.0);
+    let bx = (sw - bw) / 2.0;
+    let by = sh * 0.65;
+    let hov = in_box(mx, my, bx, by, bw, bh);
+    let btn_col = if won { Color::from_rgba(30, 100, 30, 255) } else { Color::from_rgba(80, 30, 30, 255) };
+    let btn_hov = if won { Color::from_rgba(50, 160, 50, 255) } else { Color::from_rgba(130, 50, 50, 255) };
+    draw_rectangle(bx, by, bw, bh, if hov { btn_hov } else { btn_col });
+    draw_rectangle_lines(bx, by, bw, bh, 2.0, LIGHTGRAY);
+    let lbl = "Continue";
+    let lfs = bh * 0.46;
+    let lw  = measure_text(lbl, None, lfs as u16, 1.0).width;
+    draw_text(lbl, bx + (bw - lw) / 2.0, by + bh * 0.68, lfs, WHITE);
+
+    click && hov
+}
+
 // ---------------------------------------------------------------------------
 // Window config
 // ---------------------------------------------------------------------------
@@ -791,6 +925,60 @@ async fn main() {
             if action == Some("back") {
                 screen = Screen::Menu { status: String::new() };
             }
+            next_frame().await;
+            continue;
+        }
+
+        // ---- Post-match screen ------------------------------------------
+        if let Screen::PostMatch { won } = screen {
+            if draw_post_match(won, mx, my, click) {
+                screen = Screen::Menu { status: String::new() };
+            }
+            next_frame().await;
+            continue;
+        }
+
+        // ---- In-game menu (ESC) -----------------------------------------
+        if matches!(screen, Screen::InGameMenu(_)) {
+            let esc = is_key_pressed(KeyCode::Escape);
+            if let Screen::InGameMenu(ref mut app) = screen { app.poll(); }
+            let action = draw_ingame_menu(mx, my, click);
+            match if esc { Some("continue") } else { action } {
+                Some("continue") => screen = match screen {
+                    Screen::InGameMenu(app) => Screen::InGame(app), _ => unreachable!()
+                },
+                Some("settings") => screen = match screen {
+                    Screen::InGameMenu(app) => Screen::Settings(app), _ => unreachable!()
+                },
+                Some("surrender") => {
+                    if let Screen::InGameMenu(ref app) = screen {
+                        app.send(&ClientMessage::Surrender);
+                    }
+                    screen = Screen::PostMatch { won: false };
+                }
+                _ => {}
+            }
+            next_frame().await;
+            continue;
+        }
+
+        // ---- Settings screen --------------------------------------------
+        if matches!(screen, Screen::Settings(_)) {
+            let action = draw_settings(mx, my, click);
+            if action == Some("back") {
+                screen = match screen {
+                    Screen::Settings(app) => Screen::InGameMenu(app), _ => unreachable!()
+                };
+            }
+            next_frame().await;
+            continue;
+        }
+
+        // ---- Open in-game menu on ESC -----------------------------------
+        if matches!(screen, Screen::InGame(_)) && is_key_pressed(KeyCode::Escape) {
+            screen = match screen {
+                Screen::InGame(app) => Screen::InGameMenu(app), _ => unreachable!()
+            };
             next_frame().await;
             continue;
         }
@@ -1036,15 +1224,12 @@ async fn main() {
         draw_text("select+enemy      attack", px, 568.0, 12.0, DARKGRAY);
         draw_text("R-click           clear",  px, 582.0, 12.0, DARKGRAY);
 
-        // ---- win overlay ------------------------------------------------
+        // ---- transition to post-match on game over ----------------------
         if let Some(winner) = app.game_over {
-            let ow = l.panel_x * 0.7;
-            let ox = (l.panel_x - ow) / 2.0;
-            let oy = sh / 2.0 - 65.0;
-            draw_rectangle(ox, oy, ow, 130.0, Color::from_rgba(0, 0, 0, 210));
-            let is_me = view.my_index == winner;
-            let (txt, col) = if is_me { ("YOU WIN!", GOLD) } else { ("YOU LOSE!", RED) };
-            draw_text(txt, ox + 20.0, oy + 80.0, l.ch * 0.62, col);
+            let won = view.my_index == winner;
+            screen = Screen::PostMatch { won };
+            next_frame().await;
+            continue;
         }
 
         // ---- drag ghost -------------------------------------------------

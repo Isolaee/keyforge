@@ -1,5 +1,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
+use std::sync::mpsc;
+use std::thread;
 
 use crate::card::CardDef;
 use crate::game::{
@@ -80,6 +82,8 @@ pub fn dispatch_message(
             step_forge_key(&mut game.players[new_ap].player);
             Ok(())
         }
+        // Intercepted in run_session before reaching here.
+        ClientMessage::Surrender => unreachable!("Surrender handled in run_session"),
     }
 }
 
@@ -93,13 +97,6 @@ fn send_msg(stream: &mut TcpStream, msg: &ServerMessage) -> bool {
     stream.write_all(line.as_bytes()).is_ok() && stream.flush().is_ok()
 }
 
-fn recv_msg(reader: &mut BufReader<TcpStream>) -> Option<ClientMessage> {
-    let mut line = String::new();
-    match reader.read_line(&mut line) {
-        Ok(0) | Err(_) => None,
-        Ok(_) => serde_json::from_str(line.trim()).ok(),
-    }
-}
 
 /// Build the default 8-card game used by the server.
 pub fn build_game() -> GameState {
@@ -121,12 +118,14 @@ pub fn build_game() -> GameState {
 
 /// Run one complete game session between two accepted TCP streams.
 /// Returns when the game ends (GameOver) or either client disconnects.
+///
+/// Each player gets its own reader thread so messages (including Surrender)
+/// are received in real time regardless of whose turn it is.
 pub fn run_session(stream0: TcpStream, stream1: TcpStream) {
     let mut streams = [
         stream0.try_clone().expect("clone stream0"),
         stream1.try_clone().expect("clone stream1"),
     ];
-    let mut readers = [BufReader::new(stream0), BufReader::new(stream1)];
 
     if !send_msg(&mut streams[0], &ServerMessage::Welcome { player_index: 0 }) { return; }
     if !send_msg(&mut streams[1], &ServerMessage::Welcome { player_index: 1 }) { return; }
@@ -138,15 +137,59 @@ pub fn run_session(stream0: TcpStream, stream1: TcpStream) {
         if !send_msg(&mut streams[i], &ServerMessage::GameState(view)) { return; }
     }
 
+    // One reader thread per player — both feed into a shared channel so either
+    // player can send messages (e.g. Surrender) at any time.
+    let (tx, rx) = mpsc::channel::<(usize, Option<ClientMessage>)>();
+    for (i, stream) in [stream0, stream1].into_iter().enumerate() {
+        let tx = tx.clone();
+        thread::spawn(move || {
+            let mut reader = BufReader::new(stream);
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => { let _ = tx.send((i, None)); break; }
+                    Ok(_) => {
+                        let msg = serde_json::from_str::<ClientMessage>(line.trim()).ok();
+                        if tx.send((i, msg)).is_err() { break; }
+                    }
+                }
+            }
+        });
+    }
+    drop(tx); // rx.recv() returns Err once both threads have exited
+
     loop {
-        let ap = game.active_player;
-        let msg = match recv_msg(&mut readers[ap]) {
-            Some(m) => m,
-            None    => { eprintln!("Player {} disconnected.", ap); return; }
+        let (player_idx, msg_opt) = match rx.recv() {
+            Ok(pair) => pair,
+            Err(_)   => return,
         };
 
-        match dispatch_message(&mut game, ap, msg) {
-            Err(e) => { send_msg(&mut streams[ap], &ServerMessage::Error(e)); }
+        let msg = match msg_opt {
+            Some(m) => m,
+            None    => {
+                let winner = 1 - player_idx;
+                eprintln!("Player {} disconnected — player {} wins.", player_idx, winner);
+                send_msg(&mut streams[winner], &ServerMessage::GameOver { winner });
+                return;
+            }
+        };
+
+        if matches!(msg, ClientMessage::Surrender) {
+            let winner = 1 - player_idx;
+            eprintln!("Player {} surrendered — player {} wins.", player_idx, winner);
+            let over = ServerMessage::GameOver { winner };
+            send_msg(&mut streams[0], &over);
+            send_msg(&mut streams[1], &over);
+            return;
+        }
+
+        // Non-Surrender messages from the inactive player are ignored.
+        if player_idx != game.active_player {
+            continue;
+        }
+
+        match dispatch_message(&mut game, player_idx, msg) {
+            Err(e) => { send_msg(&mut streams[player_idx], &ServerMessage::Error(e)); }
             Ok(()) => {
                 for i in 0..2 {
                     if game.players[i].player.keys.has_won() {
@@ -158,7 +201,12 @@ pub fn run_session(stream0: TcpStream, stream1: TcpStream) {
                 }
                 for i in 0..2 {
                     let view = to_client_view(&game, i);
-                    if !send_msg(&mut streams[i], &ServerMessage::GameState(view)) { return; }
+                    if !send_msg(&mut streams[i], &ServerMessage::GameState(view)) {
+                        let winner = 1 - i;
+                        eprintln!("Player {} disconnected — player {} wins.", i, winner);
+                        send_msg(&mut streams[winner], &ServerMessage::GameOver { winner });
+                        return;
+                    }
                 }
             }
         }
