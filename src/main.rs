@@ -206,21 +206,29 @@ fn draw_zone(l: &L, x: f32, y: f32, label: &str, count: usize, highlight: bool) 
     draw_text(&s, x + l.zone_w / 2.0 - s.len() as f32 * fs * 0.5, y + l.ch * 0.6, fs, WHITE);
 }
 
-fn draw_artifact_row(l: &L, artifacts: &[CardView], is_mine: bool, y: f32) {
+fn draw_artifact_row(l: &L, artifacts: &[CardView], _is_mine: bool, y: f32) {
     let count = artifacts.len();
-    let bg_base = if is_mine {
-        Color::from_rgba(70, 30, 110, 255)
-    } else {
-        Color::from_rgba(50, 20, 80, 255)
-    };
     for (i, card) in artifacts.iter().enumerate() {
-        let x = l.blx(i, count);
-        draw_rectangle(x, y, l.cw, l.art_h, bg_base);
-        draw_rectangle_lines(x, y, l.cw, l.art_h, 2.0, DARKGRAY);
-        let name = &card.name;
-        let n = if name.len() > 11 { &name[..11] } else { name };
-        draw_text(n, x + 4.0, y + l.art_h * 0.38, l.art_h * 0.28, WHITE);
-        draw_text("Artifact", x + 4.0, y + l.art_h * 0.88, l.art_h * 0.22, LIGHTGRAY);
+        let x    = l.blx(i, count);
+        let hcol = house_color(card.house);
+        let art_w = l.cw * 0.30;
+        // art strip on left
+        draw_rectangle(x, y, art_w, l.art_h,
+            Color::from_rgba((hcol.r * 70.0) as u8, (hcol.g * 70.0) as u8, (hcol.b * 70.0) as u8, 255));
+        // body
+        draw_rectangle(x + art_w, y, l.cw - art_w, l.art_h, Color::from_rgba(210, 200, 180, 255));
+        // house label in art strip
+        let hfs = l.art_h * 0.22;
+        draw_text(house_short(card.house), x + 2.0, y + hfs + 2.0, hfs, WHITE);
+        // name
+        let nfs = l.art_h * 0.24;
+        draw_text(&card.name, x + art_w + 3.0, y + l.art_h * 0.38, nfs,
+            Color::from_rgba(20, 20, 20, 255));
+        // type
+        draw_text("ARTIFACT", x + art_w + 3.0, y + l.art_h * 0.75, l.art_h * 0.19,
+            Color::from_rgba(80, 60, 30, 255));
+        // border
+        draw_rectangle_lines(x, y, l.cw, l.art_h, 2.0, hcol);
     }
 }
 
@@ -246,20 +254,216 @@ fn wrap_text(text: &str, font_size: f32, max_width: f32) -> Vec<String> {
     lines
 }
 
-fn draw_card(l: &L, x: f32, y: f32, name: &str, text: &str, sub: &str, bg: Color, border: Color) {
-    draw_rectangle(x, y, l.cw, l.ch, bg);
-    draw_rectangle_lines(x, y, l.cw, l.ch, 2.0, border);
-    let n = if name.len() > 11 { &name[..11] } else { name };
-    draw_text(n, x + 4.0, y + l.ch * 0.17, l.ch * 0.11, WHITE);
+fn house_color(house: House) -> Color {
+    match house {
+        House::Brobnar      => Color::from_rgba(210,  90,  30, 255),
+        House::Dis          => Color::from_rgba(140,  30, 170, 255),
+        House::Logos        => Color::from_rgba( 30,  80, 200, 255),
+        House::Mars         => Color::from_rgba(170,  50,  50, 255),
+        House::Redemption   => Color::from_rgba(180, 120,  30, 255),
+        House::Sanctum      => Color::from_rgba(200, 170,  30, 255),
+        House::Shadows      => Color::from_rgba( 40,  30,  80, 255),
+        House::StarAlliance => Color::from_rgba( 30, 150, 160, 255),
+        House::Untamed      => Color::from_rgba( 30, 140,  50, 255),
+        _                   => Color::from_rgba( 90,  90,  90, 255),
+    }
+}
 
-    let text_fs = l.ch * 0.09;
-    let line_h  = l.ch * 0.115;
-    let text_start_y = y + l.ch * 0.30;
-    for (i, line) in wrap_text(text, text_fs, l.cw - 8.0).iter().enumerate() {
-        draw_text(line, x + 4.0, text_start_y + i as f32 * line_h, text_fs, WHITE);
+fn house_short(house: House) -> &'static str {
+    match house {
+        House::Brobnar      => "BRO",
+        House::Dis          => "DIS",
+        House::Ekwidon      => "EKW",
+        House::Geistoid     => "GEI",
+        House::Logos        => "LOG",
+        House::Mars         => "MAR",
+        House::Redemption   => "RED",
+        House::Sanctum      => "SAN",
+        House::Saurian      => "SAU",
+        House::Shadows      => "SHA",
+        House::Skyborn      => "SKY",
+        House::StarAlliance => "STA",
+        House::Unfathomable => "UNF",
+        House::Untamed      => "UNT",
+    }
+}
+
+fn draw_card_back(l: &L, x: f32, y: f32) {
+    draw_rectangle(x, y, l.cw, l.ch, Color::from_rgba(18, 18, 55, 255));
+    draw_rectangle_lines(x, y, l.cw, l.ch, 2.0, Color::from_rgba(70, 70, 130, 255));
+    let m = l.cw * 0.12;
+    draw_rectangle(x + m, y + m, l.cw - m * 2.0, l.ch - m * 2.0,
+        Color::from_rgba(28, 28, 72, 255));
+    draw_rectangle_lines(x + m, y + m, l.cw - m * 2.0, l.ch - m * 2.0,
+        1.5, Color::from_rgba(90, 90, 160, 255));
+}
+
+/// Draw a full face-up card. `selected` shows a gold border, `playable` brightens the frame.
+fn draw_card(l: &L, x: f32, y: f32, card: &CardView, selected: bool, playable: bool) {
+    let hcol  = house_color(card.house);
+    let border = if selected       { GOLD }
+                 else if playable  { WHITE }
+                 else              { Color::from_rgba((hcol.r * 180.0) as u8,
+                                                      (hcol.g * 180.0) as u8,
+                                                      (hcol.b * 180.0) as u8, 255) };
+
+    // ── proportions ───────────────────────────────────────────────────────
+    let art_h    = l.ch * 0.40;          // art placeholder
+    let banner_h = l.ch * 0.11;          // name banner
+    let stat_h   = l.ch * 0.14;          // bottom stats bar
+    let body_y   = y + art_h + banner_h; // top of text body
+    let stat_y   = y + l.ch - stat_h;    // top of stats bar
+
+    // ── card body (parchment) ─────────────────────────────────────────────
+    draw_rectangle(x, y, l.cw, l.ch, Color::from_rgba(228, 218, 196, 255));
+
+    // ── art placeholder ───────────────────────────────────────────────────
+    let art_bg = Color::from_rgba(
+        (hcol.r * 80.0)  as u8,
+        (hcol.g * 80.0)  as u8,
+        (hcol.b * 80.0)  as u8, 255);
+    draw_rectangle(x + 2.0, y + 2.0, l.cw - 4.0, art_h - 2.0, art_bg);
+
+    // house label – top-left of art
+    let hfs = l.ch * 0.095;
+    draw_text(house_short(card.house), x + 4.0, y + hfs + 2.0, hfs, WHITE);
+
+    // aember bonus icon – top-right of art
+    if !card.bonus_icons.is_empty() {
+        let afs = l.ch * 0.095;
+        draw_text("◆", x + l.cw - afs * 1.2, y + afs + 2.0, afs, GOLD);
     }
 
-    draw_text(sub, x + 4.0, y + l.ch * 0.93, l.ch * 0.10, LIGHTGRAY);
+    // damage badge in art area (red pill, bottom-right)
+    if card.damage > 0 {
+        let dfs = l.ch * 0.095;
+        let ds = format!("✕{}", card.damage);
+        let dw = measure_text(&ds, None, dfs as u16, 1.0).width;
+        let dx = x + l.cw - dw - 4.0;
+        let dy = y + art_h - dfs - 4.0;
+        draw_rectangle(dx - 2.0, dy - dfs * 0.85, dw + 4.0, dfs + 2.0,
+            Color::from_rgba(180, 20, 20, 220));
+        draw_text(&ds, dx, dy, dfs, WHITE);
+    }
+
+    // aember on creature
+    if card.aember > 0 {
+        let afs = l.ch * 0.09;
+        let s   = format!("◆{}", card.aember);
+        draw_text(&s, x + 4.0, y + art_h - 4.0, afs, GOLD);
+    }
+
+    // ── name banner ───────────────────────────────────────────────────────
+    let banner_y = y + art_h;
+    draw_rectangle(x, banner_y, l.cw, banner_h, hcol);
+    // subtle darker strip under banner for depth
+    draw_rectangle(x, banner_y + banner_h - 2.0, l.cw, 2.0,
+        Color::from_rgba(0, 0, 0, 80));
+
+    let nfs = l.ch * 0.095;
+    let name = &card.name;
+    let nw   = measure_text(name, None, nfs as u16, 1.0).width;
+    let nx   = if nw < l.cw - 8.0 { x + (l.cw - nw) / 2.0 } else { x + 3.0 };
+    draw_text(name, nx, banner_y + banner_h * 0.75, nfs, WHITE);
+
+    // ── type + traits ─────────────────────────────────────────────────────
+    let type_str = match card.card_type {
+        CardType::Creature => "CREATURE",
+        CardType::Action   => "ACTION",
+        CardType::Artifact => "ARTIFACT",
+        CardType::Upgrade  => "UPGRADE",
+    };
+    let tfs = l.ch * 0.082;
+    let tw  = measure_text(type_str, None, tfs as u16, 1.0).width;
+    let mut text_cursor = body_y + tfs + 1.0;
+    draw_text(type_str, x + (l.cw - tw) / 2.0, text_cursor,
+        tfs, Color::from_rgba(60, 40, 20, 255));
+    text_cursor += tfs + 1.0;
+
+    if !card.traits.is_empty() {
+        let trfs = l.ch * 0.076;
+        let tr   = card.traits.join(" · ").to_uppercase();
+        let trw  = measure_text(&tr, None, trfs as u16, 1.0).width;
+        draw_text(&tr, x + (l.cw - trw.min(l.cw - 4.0)) / 2.0, text_cursor,
+            trfs, Color::from_rgba(80, 60, 30, 255));
+        text_cursor += trfs + 1.0;
+    }
+
+    // thin separator line
+    draw_line(x + 4.0, text_cursor, x + l.cw - 4.0, text_cursor,
+        1.0, Color::from_rgba(160, 140, 110, 255));
+    text_cursor += 3.0;
+
+    // ── card text ─────────────────────────────────────────────────────────
+    let cfs     = l.ch * 0.082;
+    let line_h  = cfs + 1.5;
+    let max_text_y = stat_y - 2.0;
+    for line in wrap_text(&card.text, cfs, l.cw - 6.0) {
+        if text_cursor + cfs > max_text_y { break; }
+        draw_text(&line, x + 3.0, text_cursor, cfs, Color::from_rgba(15, 15, 15, 255));
+        text_cursor += line_h;
+    }
+
+    // ── stats bar ─────────────────────────────────────────────────────────
+    draw_rectangle(x, stat_y, l.cw, stat_h, Color::from_rgba(35, 35, 35, 255));
+    draw_line(x, stat_y, x + l.cw, stat_y, 1.5, Color::from_rgba(0, 0, 0, 180));
+
+    // power circle (creatures)
+    if let Some(base_p) = card.power {
+        let eff = (base_p as i32 + card.power_counters).max(0);
+        let ps  = eff.to_string();
+        let r   = stat_h * 0.38;
+        let cx  = x + r + 5.0;
+        let cy  = stat_y + stat_h / 2.0;
+        draw_circle(cx, cy, r, Color::from_rgba(200, 30, 30, 255));
+        draw_circle_lines(cx, cy, r + 0.5, 1.0, Color::from_rgba(255, 100, 100, 255));
+        let pfs = r * 1.5;
+        let pw  = measure_text(&ps, None, pfs as u16, 1.0).width;
+        draw_text(&ps, cx - pw / 2.0, cy + r * 0.42, pfs, WHITE);
+    }
+
+    // armor shield (if any)
+    let eff_armor = card.armor.unwrap_or(0) + card.armor_bonus;
+    if eff_armor > 0 {
+        let s  = eff_armor.to_string();
+        let r  = stat_h * 0.36;
+        let cx = x + l.cw - r - 5.0;
+        let cy = stat_y + stat_h / 2.0;
+        // shield shape: rect + small triangle bottom (approximate with two rects)
+        let sw2 = r * 0.95;
+        draw_rectangle(cx - sw2, cy - r, sw2 * 2.0, r * 1.6,
+            Color::from_rgba(50, 100, 210, 255));
+        draw_rectangle(cx - sw2 * 0.6, cy + r * 0.5, sw2 * 1.2, r * 0.5,
+            Color::from_rgba(50, 100, 210, 255));
+        draw_rectangle_lines(cx - sw2, cy - r, sw2 * 2.0, r * 1.6,
+            1.0, Color::from_rgba(120, 170, 255, 255));
+        let afs = r * 1.4;
+        let aw  = measure_text(&s, None, afs as u16, 1.0).width;
+        draw_text(&s, cx - aw / 2.0, cy + r * 0.28, afs, WHITE);
+    }
+
+    // ── status badges ─────────────────────────────────────────────────────
+    if card.stun {
+        draw_rectangle(x + l.cw * 0.38, y + 2.0, l.cw * 0.58, l.ch * 0.115,
+            Color::from_rgba(240, 150, 0, 230));
+        let sfs = l.ch * 0.088;
+        draw_text("STUN", x + l.cw * 0.42, y + l.ch * 0.098, sfs, BLACK);
+    }
+    if card.ward {
+        draw_rectangle(x + 2.0, y + art_h - l.ch * 0.13, l.cw * 0.40, l.ch * 0.12,
+            Color::from_rgba(50, 120, 230, 220));
+        draw_text("WARD", x + 4.0, y + art_h - l.ch * 0.022, l.ch * 0.085, WHITE);
+    }
+
+    // exhausted overlay
+    if card.exhausted {
+        draw_rectangle(x, y, l.cw, l.ch, Color::from_rgba(0, 0, 0, 90));
+        draw_rectangle(x + 2.0, y + 2.0, l.cw - 4.0, art_h - 2.0,
+            Color::from_rgba(0, 0, 0, 70));
+    }
+
+    // ── outer border (on top of everything) ──────────────────────────────
+    draw_rectangle_lines(x, y, l.cw, l.ch, if selected { 2.5 } else { 2.0 }, border);
 }
 
 fn btn(x: f32, y: f32, w: f32, h: f32, label: &str, active: bool,
@@ -275,18 +479,6 @@ fn btn(x: f32, y: f32, w: f32, h: f32, label: &str, active: bool,
     click && in_box(mx, my, x, y, w, h)
 }
 
-fn card_sub_view(c: &CardView) -> String {
-    match c.card_type {
-        CardType::Creature => {
-            let base = c.power.unwrap_or(0) as i32;
-            let effective = (base + c.power_counters).max(0) as u32;
-            format!("PWR:{} DMG:{}", effective, c.damage)
-        }
-        CardType::Artifact => "Artifact".into(),
-        CardType::Action   => "Action".into(),
-        CardType::Upgrade  => "Upgrade".into(),
-    }
-}
 
 fn can_use_card(active_house: Option<House>, card: &CardView) -> bool {
     match active_house {
@@ -639,8 +831,7 @@ async fn main() {
 
         // ---- Opponent hand (face-down) ----------------------------------
         for i in 0..view.opp_hand_count {
-            draw_card(&l, l.cx(i), l.p1_hand_y,
-                "?", "", "", Color::from_rgba(25, 25, 80, 255), GRAY);
+            draw_card_back(&l, l.cx(i), l.p1_hand_y);
         }
         draw_zone(&l, l.deck_x, l.p1_hand_y, "Deck",    view.opp_deck_count,      false);
         draw_zone(&l, l.arch_x, l.p1_hand_y, "Archive", view.opp_archives_count,   false);
@@ -651,11 +842,7 @@ async fn main() {
         for (i, card) in view.opp_battleline.iter().enumerate() {
             let x = l.blx(i, opp_count);
             let selected = app.selected_creature == Some(card.id);
-            let bg = if card.exhausted { Color::from_rgba(70, 15, 15, 255) }
-                     else              { Color::from_rgba(160, 30, 30, 255) };
-            let border = if selected { YELLOW } else { DARKGRAY };
-            draw_card(&l, x, l.p1_line_y, &card.name,
-                &card.text, &card_sub_view(card), bg, border);
+            draw_card(&l, x, l.p1_line_y, card, selected, false);
             if i == 0 {
                 draw_flank_badge(&l, x, l.p1_line_y, "◄L", Color::from_rgba(255, 160, 160, 255));
             }
@@ -686,11 +873,8 @@ async fn main() {
         for (i, card) in view.my_battleline.iter().enumerate() {
             let x = l.blx(i, my_count);
             let selected = app.selected_creature == Some(card.id);
-            let bg = if card.exhausted { Color::from_rgba(15, 60, 15, 255) }
-                     else              { Color::from_rgba(25, 130, 25, 255) };
-            let border = if selected { YELLOW } else { DARKGRAY };
-            draw_card(&l, x, l.p0_line_y, &card.name,
-                &card.text, &card_sub_view(card), bg, border);
+            let playable = can_use_card(view.active_house, card) && !card.exhausted;
+            draw_card(&l, x, l.p0_line_y, card, selected, playable);
             if i == 0 {
                 draw_flank_badge(&l, x, l.p0_line_y, "◄L", Color::from_rgba(160, 255, 160, 255));
             }
@@ -773,12 +957,7 @@ async fn main() {
         for (i, card) in view.my_hand.iter().enumerate() {
             let selected = app.selected_hand == Some(card.id);
             let playable = can_use_card(view.active_house, card);
-            let bg = if selected        { Color::from_rgba(180, 140, 0, 255) }
-                     else if playable   { Color::from_rgba(30, 60, 160, 255) }
-                     else               { Color::from_rgba(20, 20, 50, 255) };
-            let border = if selected { WHITE } else if playable { GRAY } else { DARKGRAY };
-            draw_card(&l, l.cx(i), l.p0_hand_y,
-                &card.name, &card.text, &card_sub_view(card), bg, border);
+            draw_card(&l, l.cx(i), l.p0_hand_y, card, selected, playable);
             if click && l.hit(mx, my, l.cx(i), l.p0_hand_y) && my_turn {
                 app.drag_card = Some(card.id);
                 app.selected_hand = None;
@@ -874,8 +1053,7 @@ async fn main() {
             if is_mouse_button_down(MouseButton::Left) {
                 if let Some(card) = view.my_hand.iter().find(|c| c.id == drag_id) {
                     draw_card(&l, mx - l.cw / 2.0, my - l.ch / 2.0,
-                        &card.name, &card.text, &card_sub_view(card),
-                        Color::from_rgba(200, 180, 60, 210), WHITE);
+                        card, false, true);
                 }
             }
         }
